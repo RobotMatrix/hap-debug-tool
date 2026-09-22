@@ -73,6 +73,13 @@ tar -czf hap-tools.tar.gz -C packaging tools
 
 未配置时仍会出 dmg，但不含内置工具（运行时需 `HAP_TOOLS_DIR` 指定）。
 
+**默认不签名、不公证**。仅当配置了证书/公证 secrets 且满足以下之一时才执行签名+公证：
+- 手动触发并勾选 `notarize`
+- 打 tag（`v*`）
+
+相关 secrets（可选）：`MACOS_CERT_P12_B64`、`MACOS_CERT_PASSWORD`、`KEYCHAIN_PASSWORD`、
+`NOTARY_APPLE_ID`、`NOTARY_TEAM_ID`、`NOTARY_PASSWORD`。
+
 ## 账户安全
 
 - 企业/团队账户默认**只读**：`cert-add` / `cert-delete` / `provision-add` / `flow` 一律拒绝

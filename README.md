@@ -56,6 +56,23 @@ python3 hap_cli.py cloud --help          # 云接口(证书/Profile)
 ./packaging/sign_notarize.sh      # 需 Developer ID 证书 + notarytool 凭据
 ```
 
+## CI 自动出 dmg
+
+`.github/workflows/build-dmg.yml`（macOS runner）在 **手动触发** 或 **打 tag（`v*`）** 时构建 dmg。
+
+内置工具（`hdc`/`signer`/`key.pem` 等）不入库，通过 secret 注入：
+
+```bash
+# 本地先打包工具（来自 小白调试助手.app 的 assets）
+tar -czf hap-tools.tar.gz -C packaging tools
+```
+
+然后在仓库 Settings → Secrets and variables → Actions 配置其一：
+- `HAP_TOOLS_URL`：`hap-tools.tar.gz` 的可下载 URL（建议放私有 release/对象存储）
+- `HAP_TOOLS_B64`：小体积时用 base64（注意 secret 上限 48KB，大文件请用 URL）
+
+未配置时仍会出 dmg，但不含内置工具（运行时需 `HAP_TOOLS_DIR` 指定）。
+
 ## 账户安全
 
 - 企业/团队账户默认**只读**：`cert-add` / `cert-delete` / `provision-add` / `flow` 一律拒绝

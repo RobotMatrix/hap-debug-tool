@@ -10,15 +10,19 @@ APP_SRC="${APP_SRC:-/Applications/小白调试助手.app}"
 ASSETS="$APP_SRC/Contents/Frameworks/App.framework/Versions/A/Resources/flutter_assets/assets"
 TOOLS="$HERE/tools"
 
-echo ">> [1/4] 收集依赖工具到 $TOOLS"
-mkdir -p "$TOOLS/store" "$TOOLS/ohos"
-for f in hdc signer libusb_shared.dylib; do
-  cp -f "$ASSETS/macos/$f" "$TOOLS/" 2>/dev/null || echo "   (缺 $f)"
-done
-cp -f "$ASSETS/store/key.pem"    "$TOOLS/store/" 2>/dev/null || true
-cp -f "$ASSETS/store/xiaobai.csr" "$TOOLS/store/" 2>/dev/null || true
-cp -f "$ASSETS/ohos/auto_installer.hap" "$TOOLS/ohos/" 2>/dev/null || true
-chmod +x "$TOOLS/hdc" "$TOOLS/signer" 2>/dev/null || true
+if [ -x "$TOOLS/hdc" ] && [ -f "$TOOLS/signer" ]; then
+  echo ">> [1/4] 已存在自带工具, 跳过收集 ($TOOLS)"
+else
+  echo ">> [1/4] 从 $APP_SRC 收集依赖工具到 $TOOLS"
+  mkdir -p "$TOOLS/store" "$TOOLS/ohos"
+  for f in hdc signer libusb_shared.dylib; do
+    cp -f "$ASSETS/macos/$f" "$TOOLS/" 2>/dev/null || echo "   (缺 $f)"
+  done
+  cp -f "$ASSETS/store/key.pem"    "$TOOLS/store/" 2>/dev/null || true
+  cp -f "$ASSETS/store/xiaobai.csr" "$TOOLS/store/" 2>/dev/null || true
+  cp -f "$ASSETS/ohos/auto_installer.hap" "$TOOLS/ohos/" 2>/dev/null || true
+  chmod +x "$TOOLS/hdc" "$TOOLS/signer" 2>/dev/null || true
+fi
 
 echo ">> [2/4] 安装 PyInstaller"
 "$PY" -m pip install -q pyinstaller 2>&1 | tail -1

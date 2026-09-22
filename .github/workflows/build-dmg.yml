@@ -1,0 +1,65 @@
+name: build-dmg
+
+on:
+  workflow_dispatch:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+jobs:
+  dmg:
+    runs-on: macos-14
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: |
+          python3 -m pip install --upgrade pip
+          python3 -m pip install pyinstaller pillow tkinterdnd2
+          brew install create-dmg || true
+
+      - name: Inject tools (optional)
+        env:
+          HAP_TOOLS_URL: ${{ secrets.HAP_TOOLS_URL }}
+          HAP_TOOLS_B64: ${{ secrets.HAP_TOOLS_B64 }}
+        run: |
+          mkdir -p packaging/tools
+          if [ -n "$HAP_TOOLS_URL" ]; then
+            echo "从 HAP_TOOLS_URL 下载工具..."
+            curl -fsSL "$HAP_TOOLS_URL" | tar -xzf - -C packaging/tools
+          elif [ -n "$HAP_TOOLS_B64" ]; then
+            echo "$HAP_TOOLS_B64" | base64 --decode | tar -xzf - -C packaging/tools
+          else
+            echo "::warning title=缺少工具::未配置 secrets.HAP_TOOLS_URL/B64，生成的 dmg 不含内置 hdc/signer/key.pem（签名/安装需另配 HAP_TOOLS_DIR）"
+          fi
+          find packaging/tools -maxdepth 2 -type f | head || true
+
+      - name: Build dmg
+        run: |
+          chmod +x packaging/*.sh
+          PY=python3 ./packaging/build_dmg.sh
+
+      - name: Rename artifact
+        run: |
+          cp "packaging/HAP调试助手.dmg" "packaging/HAP-debug-tool.dmg"
+          ls -la packaging/*.dmg
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: HAP-debug-tool-dmg
+          path: packaging/HAP-debug-tool.dmg
+          if-no-files-found: error
+
+      - name: Attach to release
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: packaging/HAP-debug-tool.dmg

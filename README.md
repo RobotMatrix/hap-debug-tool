@@ -5,6 +5,8 @@
 - 复用内置 `hdc` / `signer`，无需安装 DevEco
 - 对接华为云 DevEco Connect：申请调试证书、生成 Provision Profile
 - 拖拽 `.app` / `.hap` → 一键签名 → `hdc install` → 启动
+- 支持 App Pack(`.app` 目录或 zip)：自动重签名内部所有 `.hap`/`.hsp` 模块并整包安装
+- 启动时/执行前自动检查 `oauth2token` 是否过期，过期则清除 UI 证书与 Token 信息
 - 支持个人 / 企业(团队) 证书切换，团队账户默认只读保护
 
 ## 目录
@@ -28,6 +30,9 @@
 python3 hap_cli.py info app.hap          # 解析元信息
 python3 hap_cli.py sig  app.hap          # 查看签名信息
 python3 hap_cli.py install app.hap --no-sign
+python3 hap_cli.py sign MyApp.app -o out/   # 重签名 App Pack 内所有模块
+python3 hap_cli.py install MyApp.app        # 重签名并安装整包
+python3 hap_cli.py cloud token-check        # 检查 token 是否过期 (exit 2=过期)
 python3 hap_cli.py cloud --help          # 云接口(证书/Profile)
 ```
 
@@ -41,6 +46,12 @@ python3 hap_cli.py cloud --help          # 云接口(证书/Profile)
   → hdc install -r
   → aa start -a <mainElement> -b <bundle>
 ```
+
+App Pack(`.app`)：解出内部所有 `.hap`/`.hsp` 逐个签名后，一次性
+`hdc install <hap> <hsp...>`（hap 依赖 hsp，必须同批安装），再启动入口 Ability。
+
+Token 过期检查：调用 `user-team-list` 探测，服务端返回 HTTP 401/403 或鉴权类
+`ret.code` 即判为过期；GUI 会清空 Token / 证书名输入框并删除本地缓存凭据。
 
 ## 环境
 

@@ -245,14 +245,92 @@ def _parse_module_json(entry, raw):
 
 
 def is_signed(path):
+    p = Path(path)
+    if p.is_dir():
+        return _app_pack_signed(p)
     with open(path, "rb") as f:
         return b"<hap sign block>" in f.read()
 
 
+def _path_size(path):
+    p = Path(path)
+    if p.is_file():
+        return os.path.getsize(path)
+    return sum(f.stat().st_size for f in p.rglob("*") if f.is_file())
+
+
+def is_app_pack(path):
+    """判断是否为 App Pack(.app)：目录形式 (含 .hap/.hsp) 或 zip 形式。"""
+    p = Path(path)
+    if not str(path).endswith(".app"):
+        return False
+    if p.is_dir():
+        return any(f.is_file() and f.suffix in (".hap", ".hsp") for f in p.iterdir())
+    if p.is_file():
+        try:
+            with zipfile.ZipFile(path) as z:
+                names = z.namelist()
+                return any(n.endswith((".hap", ".hsp")) for n in names) or "pack.info" in names
+        except Exception:
+            return False
+    return False
+
+
+def _read_modules_from_zip(z, prefix=""):
+    out = []
+    for m in z.namelist():
+        if m.endswith("module.json"):
+            try:
+                out.append(_parse_module_json(prefix + m, z.read(m)))
+            except Exception:
+                continue
+    return out
+
+
+def _app_pack_signed(path):
+    """App Pack 是否已签名 (以入口 hap 为准)。"""
+    p = Path(path)
+    if p.is_dir():
+        for f in sorted(p.iterdir()):
+            if f.is_file() and f.suffix == ".hap":
+                try:
+                    with open(f, "rb") as fh:
+                        return b"<hap sign block>" in fh.read()
+                except Exception:
+                    return False
+        return False
+    try:
+        with open(path, "rb") as fh:
+            return b"<hap sign block>" in fh.read()
+    except Exception:
+        return False
+
+
 def read_hap_meta(hap):
-    """从 HAP/HSP/App Pack(.app) 中读取 module.json / pack.info (自动递归内层 hap)。"""
-    meta = {"path": str(hap), "size": os.path.getsize(hap), "modules": [],
-            "signed": None}
+    """从 HAP/HSP/App Pack(.app, 目录或 zip) 中读取 module.json / pack.info。"""
+    p = Path(hap)
+    meta = {"path": str(hap), "size": _path_size(hap), "modules": [],
+            "signed": None, "isAppPack": is_app_pack(hap)}
+
+    # 目录形式的 App Pack
+    if p.is_dir():
+        meta["files"] = sum(1 for f in p.rglob("*") if f.is_file())
+        for f in sorted(p.iterdir()):
+            if f.is_file() and f.suffix in (".hap", ".hsp"):
+                try:
+                    with zipfile.ZipFile(f) as z:
+                        meta["modules"] += _read_modules_from_zip(z, f.name + "!")
+                except Exception:
+                    continue
+        pi = p / "pack.info"
+        if pi.exists():
+            try:
+                meta["pack"] = json.loads(pi.read_text(encoding="utf-8"))
+            except Exception:
+                pass
+        meta["signed"] = _app_pack_signed(p)
+        return meta
+
     with zipfile.ZipFile(hap) as z:
         names = z.namelist()
         mods = [n for n in names if n.endswith("module.json")]
@@ -332,7 +410,13 @@ def _openssl_cert(pem):
 
 
 def read_sign_info(path):
-    """解析 HAP 签名块: 内嵌 profile + 开发者证书。"""
+    """解析 HAP/App Pack 签名块: 内嵌 profile + 开发者证书。"""
+    p = Path(path)
+    if p.is_dir() or str(path).endswith(".app"):
+        try:
+            path = resolve_hap(path)
+        except SystemExit:
+            return {"signed": False}
     with open(path, "rb") as f:
         data = f.read()
     info = {"signed": b"<hap sign block>" in data}
@@ -369,8 +453,28 @@ def read_sign_info(path):
     return info
 
 
+def _pick_entry_hap(paths):
+    for p in paths:
+        try:
+            meta = read_hap_meta(p)
+            m = meta["modules"][0] if meta["modules"] else {}
+            if m.get("moduleType") == "entry":
+                return p
+        except Exception:
+            continue
+    return paths[0]
+
+
 def resolve_hap(path):
-    """返回可签名的 .hap 路径；若是 App Pack(.app) 则解出内层 hap。"""
+    """返回可签名的 .hap 路径；App Pack(.app 目录/zip) 则返回入口 hap。"""
+    p = Path(path)
+    if p.is_dir():
+        if not is_app_pack(path):
+            raise SystemExit(f"{path} 不是有效的 App Pack")
+        haps = [str(f) for f in sorted(p.iterdir()) if f.is_file() and f.suffix == ".hap"]
+        if not haps:
+            raise SystemExit(f"{path} 中未找到 .hap")
+        return _pick_entry_hap(haps)
     if not path.endswith(".app"):
         return path
     out_dir = tempfile.mkdtemp(prefix="happack_")
@@ -380,6 +484,47 @@ def resolve_hap(path):
             raise SystemExit(f"{path} 中未找到 .hap")
         z.extract(haps[0], out_dir)
     return os.path.join(out_dir, haps[0])
+
+
+def app_pack_module_files(app_path):
+    """返回 App Pack 内的模块文件列表 (hap 在前, hsp 在后)。"""
+    p = Path(app_path)
+    mods = [str(f) for f in p.rglob("*") if f.is_file() and f.suffix in (".hap", ".hsp")]
+    mods.sort(key=lambda x: (0 if x.endswith(".hap") else 1, x))
+    return mods
+
+
+def sign_app_pack(t, app_path, out_dir, keystore, keystore_pwd, key_alias,
+                  app_cert, profile, sign_alg="SHA256withECDSA"):
+    """重签名 App Pack(.app 目录或 zip) 内所有 .hap/.hsp 模块，输出 {name}-signed.app。"""
+    src = Path(app_path)
+    if not is_app_pack(app_path):
+        raise SystemExit(f"不是有效的 App Pack: {app_path}")
+    out_dir = Path(out_dir)
+    out_dir.mkdir(parents=True, exist_ok=True)
+    dest = out_dir / (src.stem + "-signed.app")
+    if dest.exists():
+        if dest.is_dir():
+            shutil.rmtree(dest)
+        else:
+            dest.unlink()
+    if src.is_dir():
+        shutil.copytree(src, dest)
+    else:
+        dest.mkdir()
+        with zipfile.ZipFile(src) as z:
+            z.extractall(dest)
+    modules = [f for f in sorted(dest.rglob("*")) if f.is_file() and f.suffix in (".hap", ".hsp")]
+    if not modules:
+        raise SystemExit(f"{app_path} 中未找到 .hap/.hsp 模块")
+    Log.info(f"App Pack 共 {len(modules)} 个模块，逐个重签名 ...")
+    for f in modules:
+        tmp = f.with_name(f.stem + ".signed" + f.suffix)
+        do_sign(t, str(f), str(tmp), keystore, keystore_pwd, key_alias,
+                app_cert, profile, sign_alg)
+        os.replace(str(tmp), str(f))
+    Log.ok(f"App Pack 已重签名 -> {dest}")
+    return str(dest)
 
 
 def cmd_info(args):
@@ -484,11 +629,15 @@ def cmd_sig(args):
 def cmd_sign(args):
     t = Tools(args.app, args.tools)
     src = args.hap
-    if not os.path.isfile(src):
+    if not os.path.exists(src):
         raise SystemExit(f"文件不存在: {src}")
+    keystore, pwd, alias, cert, profile = resolve_sign_args(t, args)
+    if is_app_pack(src):
+        out_dir = args.out or os.path.dirname(os.path.abspath(src))
+        sign_app_pack(t, src, out_dir, keystore, pwd, alias, cert, profile, args.sign_alg)
+        return
     hap = resolve_hap(src)
     out = args.out or os.path.splitext(src)[0] + "-signed.hap"
-    keystore, pwd, alias, cert, profile = resolve_sign_args(t, args)
     do_sign(t, hap, out, keystore, pwd, alias, cert, profile, args.sign_alg)
 
 
@@ -618,6 +767,16 @@ class Hdc:
         a.append(hap)
         return self.raw(a, check=False, capture=True)
 
+    def install_packages(self, paths, replace=True, shared=False):
+        """一次安装多个包 (App Pack 的 hap + hsp 需同时安装才能解析依赖)。"""
+        a = ["install"]
+        if replace:
+            a.append("-r")
+        if shared:
+            a.append("-s")
+        a += [str(p) for p in paths]
+        return self.raw(a, check=False, capture=True)
+
     def uninstall(self, bundle, keep=False, shared=False):
         a = ["uninstall"]
         if keep:
@@ -694,8 +853,13 @@ def cmd_install(args):
     t = Tools(args.app, args.tools)
     h = Hdc(t, args.connect_key)
     src = args.hap
-    if not os.path.isfile(src):
+    if not os.path.exists(src):
         raise SystemExit(f"文件不存在: {src}")
+
+    if is_app_pack(src):
+        _install_app_pack(t, h, src, args)
+        return
+
     hap = resolve_hap(src)
 
     # 1. 可选签名
@@ -722,6 +886,24 @@ def cmd_install(args):
             Log.err("安装失败。可尝试 --device-side 走设备端 auto_installer 流程。")
             raise SystemExit(rc)
         Log.ok("安装完成")
+
+
+def _install_app_pack(t, h, src, args):
+    """重签名并安装 App Pack(.app)：hap + hsp 需同时安装。"""
+    if args.no_sign:
+        modules = app_pack_module_files(src)
+    else:
+        keystore, pwd, alias, cert, profile = resolve_sign_args(t, args)
+        out_dir = os.path.dirname(os.path.abspath(args.out)) if args.out else tempfile.mkdtemp(prefix="happack_sign_")
+        signed = sign_app_pack(t, src, out_dir, keystore, pwd, alias, cert, profile, args.sign_alg)
+        modules = app_pack_module_files(signed)
+    print("安装模块: " + ", ".join(os.path.basename(m) for m in modules))
+    rc, out = h.install_packages(modules, replace=True)
+    print(out.rstrip())
+    if rc != 0 or "fail" in out.lower():
+        Log.err("App Pack 安装失败。")
+        raise SystemExit(rc or 1)
+    Log.ok("App Pack 安装完成")
 
 
 def pkg_dir(bundle):
@@ -906,6 +1088,66 @@ def http_json(url, method="GET", token=None, client_id=None, body=None, extra_he
     return j
 
 
+def http_req_status(url, method="GET", headers=None, body=None, timeout=60):
+    """同 http_req，但返回 (status, json, raw)。网络异常时 status=0。"""
+    import gzip as _gzip
+    h = dict(headers or {})
+    data = None
+    if body is not None:
+        data = body if isinstance(body, (bytes, bytearray)) else json.dumps(body).encode("utf-8")
+    req = urllib.request.Request(url, data=data, headers=h, method=method)
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            status = resp.status
+            raw = resp.read()
+            if "gzip" in (resp.headers.get("Content-Encoding") or "").lower():
+                raw = _gzip.decompress(raw)
+    except urllib.error.HTTPError as e:
+        status, raw = e.code, e.read()
+    except Exception:
+        return 0, None, b""
+    try:
+        return status, json.loads(raw.decode("utf-8", "replace")), raw
+    except Exception:
+        return status, None, raw
+
+
+AUTH_FAIL_CODES = {401, 403, 1101}
+
+
+def check_token(token, uid=None, team=None, timeout=30):
+    """检查 oauth2token 是否有效。返回 (ok, reason)。
+
+    仅当服务端明确返回鉴权失败 (HTTP 401/403 或鉴权类 ret.code) 时 ok=False；
+    网络异常/未知错误返回 ok=True，避免误清空凭据。
+    """
+    if not token:
+        return False, "token 为空"
+    status, j, _ = http_req_status(URL_TEAM_LIST, "GET", hw_headers(token, uid, team), timeout=timeout)
+    if status in (401, 403):
+        return False, f"HTTP {status} (token 过期/无效)"
+    if status == 0:
+        return True, "网络不可用，跳过检查"
+    if isinstance(j, dict):
+        ret = j.get("ret") or {}
+        code = ret.get("code")
+        if code in (0, None):
+            return True, "有效"
+        if code in AUTH_FAIL_CODES or str(code).startswith("40"):
+            return False, f"ret.code={code} {ret.get('msg', '')}".strip()
+        return True, f"ret.code={code} (非鉴权错误)"
+    return True, "响应无法解析，跳过检查"
+
+
+def clear_credentials():
+    """清除本地保存的 token / uid。"""
+    for f in (TOKEN_FILE, UID_FILE):
+        try:
+            f.unlink()
+        except OSError:
+            pass
+
+
 def guard_team(team):
     if str(team) == ENTERPRISE_TEAM:
         Log.err(f"团队账户 {ENTERPRISE_TEAM} 受保护: 禁止对其证书/Profile 增删。"
@@ -936,6 +1178,12 @@ def cmd_cloud(args):
     if sub == "login":
         _cloud_login(args)
         return
+    if sub == "token-check":
+        tok = args.token or (TOKEN_FILE.read_text().strip() if TOKEN_FILE.exists() else "")
+        uid = args.uid or (UID_FILE.read_text().strip() if UID_FILE.exists() else "")
+        ok, why = check_token(tok, uid, args.team_id)
+        print(("有效: " if ok else "过期/无效: ") + why)
+        raise SystemExit(0 if ok else 2)
     H = _cloud_ctx(args)
 
     if sub == "teams":
@@ -1294,6 +1542,7 @@ def build_parser():
     for name, help_ in [("teams", "团队列表"), ("certs", "证书列表"),
                         ("devices", "设备列表")]:
         add_auth(csub.add_parser(name, help=help_))
+    add_auth(csub.add_parser("token-check", help="检查 oauth2token 是否过期"))
     c = csub.add_parser("device-add", help="注册调试设备")
     add_auth(c)
     c.add_argument("--name", required=True); c.add_argument("--udid", required=True)

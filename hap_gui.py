@@ -195,6 +195,7 @@ class App:
         btns = ttk.Frame(cfg)
         btns.grid(row=1, column=4, padx=(6, 0), pady=3)
         ttk.Button(btns, text="🔓 登录", command=self.do_login).pack(side="left")
+        ttk.Button(btns, text="🔍 检查", command=lambda: self.check_token(notify=True)).pack(side="left", padx=(4, 0))
         ttk.Button(btns, text="🔄 团队", command=self.refresh_teams).pack(side="left", padx=(4, 0))
 
         ttk.Label(cfg, text="👤  UID:").grid(row=2, column=0, sticky="e", padx=(0, 6), pady=4)
@@ -230,6 +231,7 @@ class App:
         self.logbox.pack(fill="both", expand=True)
 
         self.root.after(100, self._drain)
+        self.root.after(800, self.check_token)
 
     def log(self, msg):
         self.logq.put(str(msg))
@@ -315,6 +317,38 @@ class App:
         if H.TOKEN_FILE.exists():
             return H.TOKEN_FILE.read_text().strip()
         return os.environ.get("HUAWEI_TOKEN", "")
+
+    def _clear_credentials(self):
+        self.token_var.set("")
+        self.cert_name.set("")
+        H.clear_credentials()
+        self._set_sig("—", "(Token 已过期，证书/Token 信息已清除)", False)
+        self.sig_toggle.config(state="disabled")
+
+    def _on_token_expired(self):
+        self._clear_credentials()
+        messagebox.showwarning("登录已过期", "Token 已过期/无效，请重新登录。\n已清除证书与 Token 信息。")
+
+    def check_token(self, notify=False):
+        tok = self.token_var.get().strip()
+        uid = self.uid_var.get().strip()
+        if not tok:
+            if notify:
+                self.log("[-] 未填写 Token")
+            return
+
+        def work():
+            try:
+                ok, why = H.check_token(tok, uid, self.team_id())
+            except Exception as e:
+                ok, why = True, f"检查异常: {e}"
+            if ok:
+                if notify:
+                    self.log(f"[+] Token 有效: {why}")
+                return
+            self.log(f"[-] Token 已过期/无效: {why}")
+            self.root.after(0, self._on_token_expired)
+        threading.Thread(target=work, daemon=True).start()
 
     def team_id(self):
         name = self.team_var.get()
@@ -403,6 +437,12 @@ class App:
             cert_name = self.cert_name.get().strip() or ("xiaobai-debug-" + time.strftime("%Y%m%d%H%M%S"))
             self.log(f"=== 开始: {bundle} | 团队 {team}(个人) | 证书 {cert_name} ===")
 
+            ok, why = H.check_token(tok, uid, team)
+            if not ok:
+                self.log(f"[-] Token 已过期/无效: {why}")
+                self.root.after(0, self._on_token_expired)
+                return
+
             Hh = H.hw_headers(tok, uid, team)
             workdir = Path.home() / "Library/Caches/hap_installer/gui"
             workdir.mkdir(parents=True, exist_ok=True)
@@ -453,19 +493,29 @@ class App:
 
             self.log("5) 本地签名")
             key = t.store_file("key.pem")
-            src = H.resolve_hap(self.hap_path)
-            signed = workdir / f"{bundle}-signed.hap"
-            H.do_sign(t, src, str(signed), key, "", "xiaobai", str(cer), str(p7b))
-            self.root.after(0, lambda p=str(signed): self._set_out(p))
-            self.log(f"   已签名: {signed}")
-
-            if not install:
-                self.log(f"[+] 完成(仅签名): {signed}")
-                return
-
-            self.log("6) hdc 安装")
             h = H.Hdc(t)
-            rc, out = h.install(str(signed), replace=True)
+            if H.is_app_pack(self.hap_path):
+                signed = H.sign_app_pack(t, self.hap_path, str(workdir), key, "", "xiaobai",
+                                         str(cer), str(p7b))
+                self.root.after(0, lambda p=str(signed): self._set_out(p))
+                self.log(f"   已重签名 App Pack: {signed}")
+                if not install:
+                    self.log(f"[+] 完成(仅签名): {signed}")
+                    return
+                self.log("6) hdc 安装 App Pack (hap + hsp)")
+                rc, out = h.install_packages(H.app_pack_module_files(signed), replace=True)
+            else:
+                src = H.resolve_hap(self.hap_path)
+                signed = workdir / f"{bundle}-signed.hap"
+                H.do_sign(t, src, str(signed), key, "", "xiaobai", str(cer), str(p7b))
+                self.root.after(0, lambda p=str(signed): self._set_out(p))
+                self.log(f"   已签名: {signed}")
+                if not install:
+                    self.log(f"[+] 完成(仅签名): {signed}")
+                    return
+                self.log("6) hdc 安装")
+                rc, out = h.install(str(signed), replace=True)
+
             self.log("   " + (out or "").strip())
             if rc != 0 or "fail" in (out or "").lower():
                 raise RuntimeError("安装失败")
@@ -494,6 +544,16 @@ class App:
                 h = H.Hdc(t)
                 bundle = (self.meta or {}).get("modules", [{}])[0].get("bundleName")
                 ability = (self.meta or {}).get("modules", [{}])[0].get("mainElement") or "EntryAbility"
+                if H.is_app_pack(self.hap_path):
+                    mods = H.app_pack_module_files(self.hap_path)
+                    self.log(f"安装 App Pack ({len(mods)} 模块) {self.hap_path} ...")
+                    self.root.after(0, lambda p=self.hap_path: self._set_out(p))
+                    rc, out = h.install_packages(mods, replace=True)
+                    self.log("   " + (out or "").strip())
+                    if rc == 0 and "fail" not in (out or "").lower() and bundle:
+                        h.shell_out("aa", "start", "-a", ability, "-b", bundle)
+                        self.log(f"[+] 已安装并启动 {bundle}")
+                    return
                 self.log(f"安装 {self.hap_path} ...")
                 self.root.after(0, lambda p=self.hap_path: self._set_out(p))
                 rc, out = h.install(self.hap_path, replace=True)

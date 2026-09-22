@@ -1,0 +1,14 @@
+#!/bin/bash
+# HAP 调试助手 命令行入口 (指向 app 内二进制)
+set -euo pipefail
+SELF="$(cd "$(dirname "$0")" && pwd)"
+for APP in \
+  "/Applications/HAP调试助手.app" \
+  "$HOME/Applications/HAP调试助手.app" \
+  "$SELF/HAP调试助手.app" ; do
+  if [ -x "$APP/Contents/MacOS/HAP调试助手" ]; then
+    exec "$APP/Contents/MacOS/HAP调试助手" "$@"
+  fi
+done
+echo "找不到 HAP调试助手.app，请先把它拖到 /Applications" >&2
+exit 1

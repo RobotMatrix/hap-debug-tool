@@ -1,0 +1,28 @@
+# 私有/敏感
+packaging/tools/
+*.pem
+*.csr
+*.p12
+*.p7b
+*.cer
+.hap_cli_token
+.hap_cli_uid
+.hap_sniff/
+
+# 构建产物
+packaging/dist/
+packaging/build/
+*.spec
+*.dmg
+rw.*.dmg
+
+# 大文件 / 输入
+*.hap
+*.hsp
+*.app
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+venv/

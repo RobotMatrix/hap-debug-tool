@@ -37,6 +37,7 @@ rm -rf dist "HAP调试助手.spec"
   --name "HAP调试助手" \
   --osx-bundle-identifier com.xiaobai.hapinstaller \
   --add-data "$TOOLS:tools" \
+  --add-data "$HERE/assets:assets" \
   --collect-all tkinterdnd2 \
   $ICON_ARG \
   --paths "$ROOT" \

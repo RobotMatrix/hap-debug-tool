@@ -13,9 +13,11 @@ hap_gui.py -- 小白调试助手 的图形前端 (重实现)
 """
 
 import os
+import plistlib
 import queue
 import re
 import sys
+import tempfile
 import threading
 import time
 import traceback
@@ -33,6 +35,12 @@ try:
 except Exception as e:
     print("无法导入 hap_cli.py:", e)
     sys.exit(1)
+
+try:
+    import ios_sign as IOS
+except Exception as e:
+    print("无法导入 ios_sign.py:", e)
+    IOS = None
 
 try:
     from tkinterdnd2 import TkinterDnD, DND_FILES
@@ -67,6 +75,31 @@ def _cn(subject):
     return m.group(1).strip() if m else (subject or "")
 
 
+def _load_platform_logos():
+    """加载平台小 logo (20px); 失败返回 {} 走纯文字"""
+    try:
+        from PIL import Image, ImageTk
+    except Exception:
+        return {}
+    base = Path(getattr(sys, "_MEIPASS", HERE))
+    if base == HERE:
+        asset_dir = HERE / "packaging/assets"
+    else:
+        asset_dir = base / "assets"
+    p = asset_dir / "harmonyos.png"
+    a = asset_dir / "apple.png"
+    if not (p.exists() and a.exists()):
+        return {}
+    try:
+        out = {}
+        for key, path in (("harmony", p), ("ios", a)):
+            im = Image.open(path).convert("RGBA").resize((20, 20), Image.LANCZOS)
+            out[key] = ImageTk.PhotoImage(im)
+        return out
+    except Exception:
+        return {}
+
+
 def sig_summary(info):
     if not info.get("signed"):
         return "未签名"
@@ -91,6 +124,11 @@ class App:
         self.teams = list(DEFAULT_TEAMS)
         self.busy = False
         self.sig_expanded = False
+        self.platform = tk.StringVar(value="harmony")   # harmony | ios
+        self.ios_meta = None
+        self.ios_profiles = []
+        self.ios_local_prov = None
+        self.ios_prov_path = None
 
         dark = is_dark_mode()
         C = {
@@ -135,12 +173,40 @@ class App:
         outer = ttk.Frame(root, padding=16)
         outer.pack(fill="both", expand=True)
 
-        ttk.Label(outer, text="📦  HAP 调试助手", style="Title.TLabel").pack(anchor="w")
-        ttk.Label(outer, text="拖入 .app / .hap 一键签名、安装、启动",
-                  style="Hint.TLabel").pack(anchor="w", pady=(2, 10))
+        self.title_lbl = ttk.Label(outer, text="📦  HAP 调试助手", style="Title.TLabel")
+        self.title_lbl.pack(anchor="w")
+        self.sub_lbl = ttk.Label(outer, text="拖入 .app / .hap 一键签名、安装、启动",
+                                 style="Hint.TLabel")
+        self.sub_lbl.pack(anchor="w", pady=(2, 6))
+
+        platrow = ttk.Frame(outer)
+        platrow.pack(fill="x", pady=(0, 8))
+        ttk.Label(platrow, text="🧭  平台:", style="Body.TLabel").pack(side="left", padx=(0, 6))
+        self._logos = _load_platform_logos()
+        img_h = self._logos.get("harmony")
+        img_i = self._logos.get("ios")
+        self.plat_h = ttk.Radiobutton(platrow, text="鸿蒙 (HAP/HSP)" if img_h else "🌸 鸿蒙 (HAP/HSP)",
+                                      value="harmony", variable=self.platform,
+                                      command=self.on_platform_change,
+                                      image=img_h, compound="left")
+        self.plat_h.image = img_h
+        self.plat_h.pack(side="left")
+        self.plat_i = ttk.Radiobutton(platrow, text="iOS (ipa/app)" if img_i else "🍎 iOS (ipa/app)",
+                                      value="ios", variable=self.platform,
+                                      command=self.on_platform_change,
+                                      image=img_i, compound="left")
+        self.plat_i.image = img_i
+        self.plat_i.pack(side="left", padx=(12, 0))
+
+        self.body = ttk.Frame(outer)
+        self.body.pack(fill="both", expand=True)
+        self.body.columnconfigure(0, weight=1)
+        self.body.rowconfigure(0, weight=1)
+        left = ttk.Frame(self.body)
+        left.grid(row=0, column=0, sticky="nsew")
 
         self.drop = tk.Label(
-            outer, text="⬇️   把 .app / .hap 拖到这里   (或点此选择文件)",
+            left, text="⬇️   把 .app / .hap 拖到这里   (或点此选择文件)",
             relief="solid", bd=1, height=4, justify="center",
             bg=self.drop_bg, fg=self.drop_fg, font=self.f_drop,
             highlightthickness=0)
@@ -150,31 +216,27 @@ class App:
             self.drop.drop_target_register(DND_FILES)
             self.drop.dnd_bind("<<Drop>>", self.on_drop)
 
-        self.info = ttk.Label(outer, text="未选择文件", justify="left")
-        self.info.pack(fill="x", pady=(8, 2))
-
-        sigrow = ttk.Frame(outer)
-        sigrow.pack(fill="x", pady=(0, 4))
-        self.sig_dot = ttk.Label(sigrow, text="●", foreground=C["sub"])
-        self.sig_dot.pack(side="left")
-        self.sig_hint = ttk.Label(sigrow, text="签名: —", foreground=C["sub"])
-        self.sig_hint.pack(side="left", padx=(4, 0))
-        self.sig_toggle = ttk.Button(sigrow, text="详情 ▸", width=8,
+        infrow = ttk.Frame(left)
+        infrow.pack(fill="x", pady=(8, 2))
+        self.sig_toggle = ttk.Button(infrow, text="详情 ▸", width=8,
                                      command=self.toggle_sig, state="disabled")
         self.sig_toggle.pack(side="right")
+        self.sig_hint = ttk.Label(infrow, text="签名: —", foreground=C["sub"])
+        self.sig_hint.pack(side="right", padx=(12, 8))
+        self.sig_dot = ttk.Label(infrow, text="●", foreground=C["sub"])
+        self.sig_dot.pack(side="right")
+        self.info = ttk.Label(infrow, text="未选择文件", justify="left", anchor="w")
+        self.info.pack(side="right", fill="x", expand=True)
 
-        self.sig_frame = ttk.Frame(outer)
-        self.sigbox = tk.Text(self.sig_frame, height=8, wrap="none", relief="flat",
-                              bg=self.box_bg, fg=self.box_fg, font=self.f_mono,
-                              highlightthickness=1, highlightbackground=C["drop_bd"])
-        self.sigbox.pack(fill="x")
-        self.sigbox.insert("end", "(无)")
-        self.sigbox.config(state="disabled")
+        self._detail_text = ""
+        self._detail_signed = False
+        self.detail_visible = False
 
-        cfg = ttk.LabelFrame(outer, text=" ⚙️  签名设置 ", padding=12)
+        cfg = ttk.LabelFrame(left, text=" ⚙️  签名设置 (鸿蒙) ", padding=12)
         cfg.pack(fill="x", pady=8)
         cfg.columnconfigure(1, weight=1)
         cfg.columnconfigure(3, weight=1)
+        self.cfg_harmony = cfg
 
         ttk.Label(cfg, text="👥  团队:").grid(row=0, column=0, sticky="e", padx=(0, 6), pady=4)
         self.team_var = tk.StringVar(value=self.teams[0][0])
@@ -203,7 +265,34 @@ class App:
         self.uid_var = tk.StringVar(value=uid0)
         ttk.Entry(cfg, textvariable=self.uid_var).grid(row=2, column=1, columnspan=3, sticky="we", pady=3)
 
-        act = ttk.Frame(outer)
+        ioscfg = ttk.LabelFrame(left, text=" ⚙️  签名设置 (iOS) ", padding=12)
+        ioscfg.columnconfigure(1, weight=1)
+        self.cfg_ios = ioscfg
+
+        ttk.Label(ioscfg, text="🪪  证书:").grid(row=0, column=0, sticky="e", padx=(0, 6), pady=4)
+        self.ios_identity_var = tk.StringVar()
+        self.ios_identity_box = ttk.Combobox(ioscfg, textvariable=self.ios_identity_var, state="readonly")
+        self.ios_identity_box.grid(row=0, column=1, sticky="we", pady=3)
+        ttk.Button(ioscfg, text="🔄 刷新", command=self.refresh_ios_identities).grid(row=0, column=2, padx=(6, 0), pady=4)
+
+        ttk.Label(ioscfg, text="📄  描述文件:").grid(row=1, column=0, sticky="e", padx=(0, 6), pady=4)
+        self.ios_prov_var = tk.StringVar()
+        self.ios_prov_box = ttk.Combobox(ioscfg, textvariable=self.ios_prov_var, state="readonly")
+        self.ios_prov_box.grid(row=1, column=1, sticky="we", pady=3)
+        self.ios_prov_btns = ttk.Frame(ioscfg)
+        self.ios_prov_btns.grid(row=1, column=2, padx=(6, 0), pady=4)
+        ttk.Button(self.ios_prov_btns, text="🔄 刷新",
+                   command=self.refresh_ios_profiles).pack(side="left")
+        ttk.Button(self.ios_prov_btns, text="📂 本地",
+                   command=self.pick_ios_provision).pack(side="left", padx=(4, 0))
+        self.ios_prov_box.bind("<<ComboboxSelected>>", lambda e: self.on_ios_provision_selected())
+
+        ttk.Label(ioscfg, text="🆔  BundleID:").grid(row=2, column=0, sticky="e", padx=(0, 6), pady=4)
+        self.ios_bundle_var = tk.StringVar()
+        ttk.Entry(ioscfg, textvariable=self.ios_bundle_var).grid(row=2, column=1, sticky="we", pady=3)
+        ttk.Label(ioscfg, text="留空 = 保持原样", style="Sub.TLabel").grid(row=2, column=2, sticky="w", padx=(6, 0))
+
+        act = ttk.Frame(left)
         act.pack(fill="x", pady=(2, 8))
         self.go = ttk.Button(act, text="🚀  一键安装并启动", style="Go.TButton", command=self.one_click)
         self.go.pack(side="left")
@@ -211,7 +300,7 @@ class App:
         ttk.Button(act, text="📲 仅安装", command=self.install_only).pack(side="left", padx=6)
         ttk.Button(act, text="🗑️ 清空日志", command=self.clear_log).pack(side="right")
 
-        outrow = ttk.Frame(outer)
+        outrow = ttk.Frame(left)
         outrow.pack(fill="x", pady=(0, 8))
         ttk.Label(outrow, text="📦  产物:").pack(side="left")
         self.out_var = tk.StringVar(value="—")
@@ -221,7 +310,7 @@ class App:
         ttk.Button(outrow, text="📋 复制路径", command=self.copy_out).pack(side="right", padx=4)
 
         logf = ttk.LabelFrame(outer, text=" 📜  日志 ", padding=4)
-        logf.pack(fill="both", expand=True)
+        logf.pack(fill="both", expand=True, pady=(8, 0))
         self.logbox = tk.Text(logf, height=10, bg=self.box_bg, fg=self.box_fg,
                               insertbackground=self.box_fg, font=self.f_mono,
                               highlightthickness=1, highlightbackground=C["drop_bd"])
@@ -232,6 +321,7 @@ class App:
 
         self.root.after(100, self._drain)
         self.root.after(800, self.check_token)
+        self.root.after(300, self.refresh_ios_profiles)
 
     def log(self, msg):
         self.logq.put(str(msg))
@@ -262,31 +352,222 @@ class App:
                 self.logbox.see("end")
         except queue.Empty:
             pass
+        if self.detail_visible and self.detail_win is not None:
+            try:
+                want_x = self.root.winfo_rootx() + self.root.winfo_width() + 8
+                want_y = self.root.winfo_rooty()
+                if abs(self.detail_win.winfo_x() - want_x) > 2 or abs(self.detail_win.winfo_y() - want_y) > 2:
+                    self._move_detail()
+            except Exception:
+                pass
         self.root.after(100, self._drain)
 
     def toggle_sig(self):
-        if self.sig_expanded:
-            self.sig_frame.pack_forget()
+        if self.detail_visible:
+            self.detail_win.destroy()
+            self.detail_win = None
+            self.detail_visible = False
             self.sig_toggle.config(text="详情 ▸")
         else:
-            self.sig_frame.pack(fill="x", pady=(0, 6))
-            self.sig_toggle.config(text="收起 ▾")
-        self.sig_expanded = not self.sig_expanded
+            self._show_detail()
+
+    def _detail_geo(self):
+        x = self.root.winfo_rootx() + self.root.winfo_width() + 8
+        y = self.root.winfo_rooty()
+        return f"380x{max(self.root.winfo_height() - 40, 300)}+{x}+{y}"
+
+    def _show_detail(self):
+        w = tk.Toplevel(self.root)
+        w.title("签名详情")
+        w.geometry(self._detail_geo())
+        w.resizable(True, True)
+        try:
+            w.transient(self.root)
+        except Exception:
+            pass
+        w.protocol("WM_DELETE_WINDOW", self.toggle_sig)
+        self.detail_head = ttk.Label(w, text="—", style="Sub.TLabel")
+        self.detail_head.pack(fill="x", padx=10, pady=(8, 4))
+        self.detail_body = tk.Text(w, wrap="char", relief="flat",
+                                   bg=self.box_bg, fg=self.box_fg, font=self.f_mono,
+                                   highlightthickness=1, highlightbackground=self.C["drop_bd"])
+        sb = ttk.Scrollbar(w, command=self.detail_body.yview)
+        self.detail_body.config(yscrollcommand=sb.set)
+        sb.pack(side="right", fill="y", padx=(0, 6), pady=(0, 8))
+        self.detail_body.pack(fill="both", expand=True, padx=(10, 0), pady=(0, 8))
+        self._render_detail()
+        self.detail_win = w
+        self.detail_visible = True
+        self.sig_toggle.config(text="收起 ▸")
+
+    def _move_detail(self):
+        if self.detail_win is not None:
+            try:
+                self.detail_win.geometry("+" + str(self.root.winfo_rootx() + self.root.winfo_width() + 8)
+                                         + "+" + str(self.root.winfo_rooty()))
+            except Exception:
+                pass
+
+    def _render_detail(self):
+        self.detail_head.config(
+            text=("● 已签名" if self._detail_signed else "● 未签名"),
+            foreground=(self.C["success"] if self._detail_signed else self.C["sub"]))
+        self.detail_body.config(state="normal")
+        self.detail_body.delete("1.0", "end")
+        self.detail_body.insert("1.0", self._detail_text or "(无)")
+        self.detail_body.config(state="disabled")
+
+    def _ellipsize(self, text, maxlen=52):
+        text = str(text).replace("\n", " ")
+        return text if len(text) <= maxlen else text[:maxlen - 1] + "…"
 
     def _set_sig(self, summary, detail, signed):
-        self.sig_hint.config(text=f"签名: {summary}",
+        self.sig_hint.config(text=f"签名: {self._ellipsize(summary, 30)}",
                              foreground=(self.C["success"] if signed else self.C["sub"]))
         self.sig_dot.config(foreground=(self.C["success"] if signed else self.C["sub"]))
-        self.sigbox.config(state="normal")
-        self.sigbox.delete("1.0", "end")
-        self.sigbox.insert("end", detail)
-        self.sigbox.config(state="disabled")
+        self._detail_text = detail
+        self._detail_signed = bool(signed)
         self.sig_toggle.config(state="normal")
+        if self.detail_visible and self.detail_win is not None:
+            self._render_detail()
+
+    def on_platform_change(self):
+        ios = self.platform.get() == "ios"
+        self.title_lbl.config(text="📱  iOS 调试助手" if ios else "📦  HAP 调试助手")
+        self.sub_lbl.config(text="拖入 .ipa / .app 一键签名、安装、启动" if ios
+                            else "拖入 .app / .hap 一键签名、安装、启动")
+        self.drop.config(text="⬇️   把 .ipa / .app 拖到这里   (或点此选择文件)" if ios
+                         else "⬇️   把 .app / .hap 拖到这里   (或点此选择文件)")
+        if ios:
+            self.cfg_harmony.pack_forget()
+            self.cfg_ios.pack(fill="x", pady=8)
+            self.refresh_ios_identities()
+            self.refresh_ios_profiles()
+        else:
+            self.cfg_ios.pack_forget()
+            self.cfg_harmony.pack(fill="x", pady=8)
+        self.info.config(text="未选择文件")
+        self.hap_path = None
+        self.meta = None
+        self.ios_meta = None
+        self._set_sig("—", "(无)", False)
+        self.sig_toggle.config(state="disabled")
+        self._set_out("—")
+        self.log("[*] 平台已切换, 请重新选择文件")
+
+    def refresh_ios_identities(self):
+        if not IOS:
+            self.log("[-] ios_sign.py 导入失败, iOS 功能不可用")
+            return
+        def work():
+            try:
+                ids = IOS.list_identities()
+            except Exception as e:
+                self.log(f"[-] 读取钥匙串身份失败: {e}")
+                return
+            def upd():
+                names = [i["name"] for i in ids]
+                self.ios_identity_box.config(values=names)
+                if names:
+                    dev = next((n for n in names if "Development" in n or "development" in n), names[0])
+                    self.ios_identity_var.set(dev)
+                    self.log(f"[+] 钥匙串身份 {len(names)} 个, 默认选: {dev}")
+                else:
+                    self.ios_identity_var.set("")
+                    self.log("[-] 钥匙串无可用代码签名身份")
+            self.root.after(0, upd)
+        threading.Thread(target=work, daemon=True).start()
+
+    def _ios_provision_display(self, pr):
+        tag = "✓" if pr["valid"] else "✗过期"
+        return f"{tag} {pr['name']} · {pr['appid']} · {pr['summary']}"
+
+    def refresh_ios_profiles(self):
+        if not IOS:
+            return
+        def work():
+            try:
+                total = IOS.list_profiles(include_expired=True, include_ineligible=True)
+                ps = IOS.list_profiles()
+            except Exception as e:
+                self.log(f"[-] 扫描描述文件失败: {e}")
+                return
+            self.ios_profiles = ps
+            def upd():
+                disp = [self._ios_provision_display(pr) for pr in ps]
+                if self.ios_local_prov:
+                    disp.append("📂 本地选择: " + Path(self.ios_local_prov).name)
+                self.ios_prov_box.config(values=disp)
+                if ps:
+                    self.ios_prov_box.current(0)
+                    self.on_ios_provision_selected()
+                    skipped = len(total) - len(ps)
+                    self.log(f"[+] 描述文件 {len(ps)} 个可用"
+                             + (f" (已过滤 {skipped} 个无效/过期)" if skipped else "")
+                             + f", 已选: {ps[0]['name']}")
+                else:
+                    self.ios_prov_var.set("")
+                    self.log(f"[-] 无可用描述文件 (扫描到 {len(total)} 个, 全部过期或不可用); "
+                             f"可用「📂 本地」手动选")
+            self.root.after(0, upd)
+        threading.Thread(target=work, daemon=True).start()
+
+    def on_ios_provision_selected(self):
+        idx = self.ios_prov_box.current()
+        if idx < 0:
+            return
+        if self.ios_local_prov and idx >= len(self.ios_profiles):
+            self._apply_provision(self.ios_local_prov)
+            return
+        if idx < len(self.ios_profiles):
+            self._apply_provision(self.ios_profiles[idx]["path"])
+
+    def _apply_provision(self, path):
+        self.ios_prov_path = path
+        try:
+            prov = IOS.read_mobileprovision(path)
+        except Exception as e:
+            self.log(f"[-] 描述文件解析失败: {e}")
+            return
+        appid = (prov.get("Entitlements") or {}).get("application-identifier", "")
+        team = prov.get("TeamIdentifier")
+        self.log(f"[+] 描述文件: {IOS.provision_summary(prov)}  AppID={appid}"
+                 + (f"  Team={team[0]}" if team else "")
+                 + f"  设备数={len(prov.get('ProvisionedDevices') or [])}")
+        bid = appid.split(".", 1)[1] if "." in appid and appid != "" else ""
+        if bid and not bid.endswith("*") and hasattr(self, "ios_bundle_var"):
+            cur = self.ios_bundle_var.get().strip()
+            if not cur:
+                self.ios_bundle_var.set(bid)
+                self.log(f"    BundleID 建议填入: {bid}")
+
+    def pick_ios_provision(self):
+        p = filedialog.askopenfilename(
+            title="选择描述文件",
+            filetypes=[("Provision Profile", "*.mobileprovision *.provisionprofile"), ("All", "*.*")])
+        if not p:
+            return
+        try:
+            prov = IOS.read_mobileprovision(p)
+        except Exception as e:
+            self.log(f"[-] 描述文件解析失败: {e}")
+            return
+        self.ios_local_prov = p
+        disp = list(self.ios_prov_box.cget("values")) + ["📂 本地选择: " + Path(p).name]
+        self.ios_prov_box.config(values=disp)
+        self.ios_prov_box.current(len(disp) - 1)
+        self._apply_provision(p)
 
     def pick_file(self):
-        p = filedialog.askopenfilename(
-            title="选择 HAP / App Pack",
-            filetypes=[("HAP / App", "*.hap *.app *.hsp"), ("All", "*.*")])
+        ios = self.platform.get() == "ios"
+        if ios:
+            p = filedialog.askopenfilename(
+                title="选择 ipa / app",
+                filetypes=[("iOS App", "*.ipa *.app"), ("All", "*.*")])
+        else:
+            p = filedialog.askopenfilename(
+                title="选择 HAP / App Pack",
+                filetypes=[("HAP / App", "*.hap *.app *.hsp"), ("All", "*.*")])
         if p:
             self.set_file(p)
 
@@ -296,12 +577,26 @@ class App:
             self.set_file(p)
 
     def set_file(self, path):
+        p = Path(path)
+        suffix = p.suffix.lower()
+        if suffix == ".ipa" and self.platform.get() != "ios":
+            self.log("[*] 检测到 .ipa, 自动切换到 iOS 模式")
+            self.platform.set("ios")
+            self.on_platform_change()
+        elif suffix in (".hap", ".hsp") and self.platform.get() == "ios":
+            self.log("[*] 检测到 .hap/.hsp, 自动切换到鸿蒙模式")
+            self.platform.set("harmony")
+            self.on_platform_change()
         self.hap_path = path
+        if self.platform.get() == "ios":
+            self.set_file_ios(path)
+            return
         try:
             self.meta = H.read_hap_meta(path)
             m = self.meta["modules"][0] if self.meta["modules"] else {}
-            self.info.config(text=f"{os.path.basename(path)}    bundle: {m.get('bundleName')}    "
-                                  f"版本: {m.get('versionName')} ({m.get('versionCode')})")
+            self.info.config(text=f"{self._ellipsize(os.path.basename(path), 38)}  "
+                                  f"bundle: {m.get('bundleName')}  "
+                                  f"版本: {m.get('versionName')}")
             self.log(f"[+] 已选择 {path}\n    bundle={m.get('bundleName')}")
         except Exception as e:
             self.info.config(text=f"解析失败: {e}")
@@ -312,6 +607,38 @@ class App:
             self._set_sig(sig_summary(si), H.format_sign_info(si), si.get("signed"))
         except Exception as e:
             self._set_sig("解析失败", f"签名信息解析失败: {e}", False)
+
+    def set_file_ios(self, path):
+        p = Path(path)
+        if p.suffix not in (".ipa", ".app"):
+            self.info.config(text=f"iOS 模式仅支持 .ipa / .app: {p.name}")
+            self.log(f"[-] iOS 模式仅支持 .ipa / .app, 收到 {p.name}")
+            return
+        try:
+            info = IOS.read_sign_info(p)
+            bundle, ver = "", "?"
+            tmp = None
+            if p.suffix == ".ipa":
+                tmp = tempfile.TemporaryDirectory(prefix="iosgui_")
+                app_dir = IOS.extract_ipa(p, tmp.name, keep_signature=True)
+            else:
+                app_dir = p
+            with open(Path(app_dir) / "Info.plist", "rb") as f:
+                pl = plistlib.load(f)
+            bundle = pl.get("CFBundleIdentifier", "")
+            ver = pl.get("CFBundleShortVersionString", "")
+            disp = pl.get("CFBundleDisplayName") or pl.get("CFBundleName") or ""
+            self.ios_meta = {"bundle": bundle, "version": str(ver), "name": str(disp)}
+            if tmp:
+                tmp.cleanup()
+            self.info.config(text=f"{self._ellipsize(p.name, 38)}  "
+                                  f"bundle: {bundle}  版本: {ver}")
+            self.log(f"[+] 已选择 {path}\n    bundle={bundle}")
+            self._set_sig(info["summary"], IOS.format_sign_info(info), info["signed"])
+        except Exception as e:
+            self.info.config(text=f"解析失败: {e}")
+            self.log(f"[-] 解析失败: {e}")
+            self.ios_meta = None
 
     def _load_token(self):
         if H.TOKEN_FILE.exists():
@@ -415,7 +742,18 @@ class App:
         if self.busy:
             return
         if not self.hap_path:
-            messagebox.showwarning("提示", "请先拖入或选择 .app/.hap")
+            messagebox.showwarning("提示", "请先拖入或选择文件")
+            return
+        if self.platform.get() == "ios":
+            if not IOS:
+                messagebox.showwarning("提示", "ios_sign.py 不可用")
+                return
+            if not self.ios_identity_var.get().strip():
+                messagebox.showwarning("提示", "请先刷新并选择签名证书")
+                return
+            self.busy = True
+            self.go.config(state="disabled")
+            threading.Thread(target=self._pipeline_ios, args=(install,), daemon=True).start()
             return
         if not self.token_var.get().strip():
             messagebox.showwarning("提示", "请填写 oauth2token (或点登录)")
@@ -423,6 +761,51 @@ class App:
         self.busy = True
         self.go.config(state="disabled")
         threading.Thread(target=self._pipeline, args=(install,), daemon=True).start()
+
+    def _pipeline_ios(self, install=True):
+        try:
+            src = Path(self.hap_path)
+            identity = self.ios_identity_var.get().strip()
+            prov = self.ios_prov_path or None
+            bundle_override = self.ios_bundle_var.get().strip() or None
+            self.log(f"=== iOS 开始: {src.name} | 证书 {identity[:60]} | "
+                     f"描述文件 {'有' if prov else '无'} ===")
+
+            workdir = Path.home() / "Library/Caches/hap_installer/gui"
+            workdir.mkdir(parents=True, exist_ok=True)
+
+            self.log("1) 重签名")
+            if src.suffix == ".ipa":
+                out = workdir / f"{src.stem}-signed.ipa"
+                IOS.sign_ipa(src, out, identity, prov,
+                             bundle_id=bundle_override)
+            else:
+                out = IOS.sign_app_source(src, workdir, identity, prov,
+                                          bundle_id=bundle_override)
+            self.root.after(0, lambda p=str(out): self._set_out(p))
+            self.log(f"   产物: {out}")
+
+            self.log("2) 校验")
+            ok, detail = IOS.verify(out)
+            self.log("   " + ("[+] 校验通过" if ok else "[-] 校验失败") + "\n   " +
+                     detail.splitlines()[0] if detail else "   (无输出)")
+            if not ok:
+                raise RuntimeError("签名校验失败")
+
+            if not install:
+                self.log(f"[+] 完成(仅签名): {out}")
+                return
+
+            self.log("3) 安装到设备")
+            IOS.install_to_device(out)
+            self.log("4) 完成 (设备上手动打开应用即可)")
+            self.log("[+] iOS 流程完成")
+        except Exception as e:
+            self.log(f"[-] 失败: {e}")
+            self.log(traceback.format_exc())
+        finally:
+            self.busy = False
+            self.root.after(0, lambda: self.go.config(state="normal"))
 
     def _pipeline(self, install):
         try:
@@ -532,9 +915,25 @@ class App:
 
     def install_only(self):
         if not self.hap_path:
-            messagebox.showwarning("提示", "请先选择已签名的 .hap")
+            messagebox.showwarning("提示", "请先选择文件")
             return
         if self.busy:
+            return
+        if self.platform.get() == "ios":
+            self.busy = True
+            self.go.config(state="disabled")
+            def ios_work():
+                try:
+                    self.log(f"安装 {self.hap_path} ...")
+                    self.root.after(0, lambda p=self.hap_path: self._set_out(p))
+                    IOS.install_to_device(self.hap_path)
+                    self.log("[+] 已发起安装 (设备上手动打开应用即可)")
+                except Exception as e:
+                    self.log(f"[-] {e}")
+                finally:
+                    self.busy = False
+                    self.root.after(0, lambda: self.go.config(state="normal"))
+            threading.Thread(target=ios_work, daemon=True).start()
             return
         self.busy = True
         self.go.config(state="disabled")

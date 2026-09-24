@@ -8,14 +8,31 @@
 - 支持 App Pack(`.app` 目录或 zip)：自动重签名内部所有 `.hap`/`.hsp` 模块并整包安装
 - 启动时/执行前自动检查 `oauth2token` 是否过期，过期则清除 UI 证书与 Token 信息
 - 支持个人 / 企业(团队) 证书切换，团队账户默认只读保护
+- **GUI 支持平台切换：鸿蒙 (HAP/HSP) / iOS (ipa/app)**
+
+## iOS 签名 (ios_sign.py)
+
+GUI 顶部选「iOS」即进入 iOS 模式：拖入 `.ipa` / `.app` → 选钥匙串证书 + 描述文件 →
+codesign 重签名 → 校验 → `xcrun devicectl` 安装。纯 macOS 系统工具链（`security`/`codesign`/`devicectl`），零第三方依赖。
+
+```bash
+python3 ios_sign.py identities            # 列出钥匙串签名身份
+python3 ios_sign.py provision xx.mobileprovision
+python3 ios_sign.py sign app.ipa -i "Apple Development: ..." -p xx.mobileprovision -o out.ipa
+python3 ios_sign.py verify out.ipa
+python3 ios_sign.py install out.ipa       # devicectl 安装到已连接设备
+python3 ios_sign.py launch com.foo.bar
+```
 
 ## 目录
 
 | 文件 | 说明 |
 |---|---|
 | `hap_cli.py` | 核心 CLI（签名/安装/云接口/签名信息解析） |
-| `hap_gui.py` | 图形界面（tkinter + tkinterdnd2，拖拽） |
+| `hap_gui.py` | 图形界面（tkinter + tkinterdnd2，拖拽，鸿蒙/iOS 双平台） |
+| `ios_sign.py` | iOS 签名 CLI/库（codesign 重签名 + devicectl 安装） |
 | `hap_sniff.py` | 本地 MITM 代理，抓取 app 对华为云的真实请求 |
+| `sdp_proxy_demo.py` | SDP 网络代理 demo（复刻客户 App 内置 `@zzy/sdp` VPN 隧道代理行为） |
 | `run_gui.command` | 双击启动 GUI |
 | `run_capture.sh` | 一键抓包（信任 CA + 起代理 + 起 app） |
 | `packaging/` | 打包为 `.dmg`（PyInstaller）、签名/公证脚本 |

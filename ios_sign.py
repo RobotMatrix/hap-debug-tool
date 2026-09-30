@@ -193,6 +193,31 @@ def find_embedded_provision(app_dir):
     return None
 
 
+def get_embedded_provision(ipa_or_app, cache_dir=None):
+    """
+    从 .ipa/.app 提取包内 embedded.mobileprovision, 返回稳定路径 (None=没有).
+    .ipa 解包到 cache_dir (<ipaname>_embedded.mobileprovision), 复用避免每次重解.
+    """
+    p = Path(ipa_or_app)
+    if cache_dir is None:
+        cache_dir = Path.home() / "Library/Caches/hap_installer/embedded_prov"
+    cache_dir = Path(cache_dir)
+    cache_dir.mkdir(parents=True, exist_ok=True)
+
+    app_dir = p
+    if p.suffix.lower() == ".ipa":
+        out = cache_dir / f"{p.stem}_embedded.mobileprovision"
+        with tempfile.TemporaryDirectory(prefix="iossign_emb_") as td:
+            app_dir = extract_ipa(p, td, keep_signature=True)
+            embedded = find_embedded_provision(app_dir)
+            if not embedded:
+                return None
+            shutil.copy2(embedded, out)
+        return out
+    embedded = find_embedded_provision(app_dir)
+    return embedded
+
+
 # ---------------------------------------------------------------- signing
 
 def sign_app(app_dir, identity, provision_path=None, entitlements_plist=None,
@@ -208,6 +233,18 @@ def sign_app(app_dir, identity, provision_path=None, entitlements_plist=None,
     if not app_dir.name.endswith(".app"):
         raise ValueError(f"不是 .app: {app_dir}")
 
+    # 未显式指定 profile 时, 优先用包内 embedded.mobileprovision 生成 entitlements:
+    # 只给 get-task-allow 会让 installd 报 0xe8008015 "A valid provisioning profile
+    # for this executable was not found" (entitlements 缺 application-identifier)
+    if not provision_path and not entitlements_plist:
+        embedded = find_embedded_provision(app_dir)
+        if embedded:
+            try:
+                read_mobileprovision(embedded)
+                provision_path = embedded
+            except Exception:
+                pass
+
     ent = {}
     if provision_path:
         provision_path = Path(provision_path)
@@ -215,7 +252,9 @@ def sign_app(app_dir, identity, provision_path=None, entitlements_plist=None,
             raise FileNotFoundError(f"描述文件不存在: {provision_path}")
         prov = read_mobileprovision(provision_path)
         ent = dict(entitlements_of(prov))
-        shutil.copy2(provision_path, app_dir / "embedded.mobileprovision")
+        embedded_dst = app_dir / "embedded.mobileprovision"
+        if provision_path.resolve() != embedded_dst.resolve():
+            shutil.copy2(provision_path, embedded_dst)
         # 统一 application-identifier 前缀与证书一致, 避免 "bundle id 不匹配" 报错
         if entitlements_overrides:
             ent.update(entitlements_overrides)
@@ -228,9 +267,25 @@ def sign_app(app_dir, identity, provision_path=None, entitlements_plist=None,
     if entitlements_overrides and not provision_path:
         ent.update(entitlements_overrides)
 
-    # 移除签名后保留的自定义 entitlements, 但 application-identifier 必须跟证书/描述文件匹配
+    # entitlements 精简: profile 允许 ≠ app 可声明. hardened-process 等变体声明
+    # 会与 CD flags 不一致, iOS 内核 spawn 时直接判 EBADMACHO (error 88,
+    # "Malformed Mach-o file"). 只保留功能性核心项, 由 overrides 显式追加其余.
+    _ENT_KEEP = (
+        "application-identifier",
+        "com.apple.developer.team-identifier",
+        "get-task-allow",
+        "keychain-access-groups",
+    )
+    dropped = sorted(set(ent) - set(_ENT_KEEP))
+    ent = {k: v for k, v in ent.items() if k in _ENT_KEEP}
+    sign_app.last_dropped_entitlements = dropped
+
+    # 不启用 Hardened Runtime (--options runtime / CD flags 0x10000):
+    # 壳处理过的二进制 (加固包) 在 runtime 严格页校验下 spawn 即被内核拒绝
+    # (error 88), 且 CD version 会被升到 0x20500. 原厂签名均为 v=0x20400/flags=0,
+    # 保持一致兼容性最好.
     if not ent:
-        ent = {"com.apple.security.get-task-allow": True}
+        ent = {"get-task-allow": True}
 
     ent_file = Path(tempfile.mkdtemp(prefix="iossign_")) / "entitlements.plist"
     with open(ent_file, "wb") as f:
@@ -257,7 +312,6 @@ def sign_app(app_dir, identity, provision_path=None, entitlements_plist=None,
 
     args = ["codesign", "--force", "--sign", identity,
             "--entitlements", str(ent_file),
-            "--options", "runtime",
             "--timestamp=none"]
     args.append(str(app_dir))
 
@@ -332,6 +386,13 @@ def sign_app_source(src, out_dir, identity, provision_path=None,
                     full = Path(root) / fn
                     z.write(full, full.relative_to(td))
     return out
+
+
+def read_bundle_id(app_dir):
+    """读 Info.plist 的 CFBundleIdentifier"""
+    info = Path(app_dir) / "Info.plist"
+    with open(info, "rb") as f:
+        return plistlib.load(f).get("CFBundleIdentifier", "")
 
 
 def set_bundle_id(app_dir, bundle_id):
@@ -503,8 +564,30 @@ def list_devices():
     raise RuntimeError(f"设备枚举失败: devicectl/cfgutil 均不可用\n{err.strip()}")
 
 
-def install_to_device(ipa_path, device_id=None, timeout=300):
-    """安装 ipa 到设备. device_id 为空时选第一台可用的物理设备; 无可用时给出具体原因"""
+def _unsigned_nested_bundles(ipa_path):
+    """返回 ipa 内未签名的嵌套 bundle 相对路径列表 (installd 会因它们拒装整个包)"""
+    try:
+        with tempfile.TemporaryDirectory(prefix="iossign_chk_") as td:
+            app = extract_ipa(ipa_path, td, keep_signature=True)
+            bad = []
+            for sub in ("Frameworks", "PlugIns", "XPCServices"):
+                d = Path(app) / sub
+                if not d.is_dir():
+                    continue
+                for x in sorted(d.iterdir()):
+                    if not x.name.endswith((".framework", ".dylib", ".appex", ".xpc")):
+                        continue
+                    rc, _out, _err = _run(["codesign", "--verify", str(x)])
+                    if rc != 0:
+                        bad.append(f"{sub}/{x.name}")
+            return bad
+    except Exception:
+        return []
+
+
+def install_to_device(ipa_path, device_id=None, timeout=300, identity=None):
+    """安装 ipa 到设备. device_id 为空时选第一台可用的物理设备; 无可用时给出具体原因.
+    identity 给出时, 检测到未签名嵌套 bundle 会自动重签后安装"""
     ipa_path = str(ipa_path)
     devs = list_devices()
     physical = [d for d in devs if d[3]]
@@ -528,6 +611,23 @@ def install_to_device(ipa_path, device_id=None, timeout=300):
             raise RuntimeError(f"没有物理 iOS 设备 (共 {len(devs)} 台, 均为模拟器/不可用)")
         device_id = target[0]
         print(f"[*] 自动选择设备: {target[1]} ({device_id})")
+    if identity is None:
+        ids = list_identities()
+        identity = ids[0]["name"] if ids else None
+    bad = _unsigned_nested_bundles(ipa_path)
+    if bad:
+        if not identity:
+            print(f"[-] 包内未签名组件: {', '.join(bad)}; 未找到可用证书, 无法自动重签, 直接尝试安装")
+        else:
+            print(f"[*] 检测到未签名组件: {', '.join(bad)} -> 自动重签 (证书: {identity})")
+            src = Path(ipa_path)
+            fixed = src.parent / f"{src.stem}-autosign.ipa"
+            sign_ipa(src, fixed, identity)
+            ok, detail = verify(fixed)
+            if not ok:
+                raise RuntimeError(f"自动重签后校验失败:\n{detail}")
+            ipa_path = str(fixed)
+            print(f"[+] 自动重签产物: {fixed}")
     rc, out, err = _run(["xcrun", "devicectl", "device", "install", "app",
                          "--device", device_id, ipa_path], timeout=timeout)
     if rc != 0:
@@ -578,6 +678,7 @@ def main():
     s = sub.add_parser("install", help="安装 ipa 到设备")
     s.add_argument("path")
     s.add_argument("-d", "--device", help="设备 UDID (默认第一台可用)")
+    s.add_argument("-i", "--identity", help="自动重签用的证书 (检测到未签名组件时启用; 默认取第一张可用证书)")
 
     s = sub.add_parser("launch", help="启动设备上的应用")
     s.add_argument("bundle_id")
@@ -626,7 +727,7 @@ def main():
         print(("[+] 校验通过" if ok else "[-] 校验失败") + "\n" + detail)
         raise SystemExit(0 if ok else 1)
     elif args.cmd == "install":
-        print(install_to_device(args.path, args.device))
+        print(install_to_device(args.path, args.device, identity=args.identity))
     elif args.cmd == "launch":
         print(launch_on_device(args.bundle_id, args.device))
 

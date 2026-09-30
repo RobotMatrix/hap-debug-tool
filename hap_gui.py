@@ -26,6 +26,7 @@ from pathlib import Path
 import tkinter as tk
 import tkinter.font as tkfont
 from tkinter import ttk, filedialog, messagebox
+import subprocess
 
 HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE))
@@ -128,6 +129,7 @@ class App:
         self.ios_meta = None
         self.ios_profiles = []
         self.ios_local_prov = None
+        self.ios_embedded_prov = None
         self.ios_prov_path = None
 
         dark = is_dark_mode()
@@ -285,6 +287,8 @@ class App:
                    command=self.refresh_ios_profiles).pack(side="left")
         ttk.Button(self.ios_prov_btns, text="📂 本地",
                    command=self.pick_ios_provision).pack(side="left", padx=(4, 0))
+        ttk.Button(self.ios_prov_btns, text="ℹ️ 详情",
+                   command=self.show_ios_provision_detail).pack(side="left", padx=(4, 0))
         self.ios_prov_box.bind("<<ComboboxSelected>>", lambda e: self.on_ios_provision_selected())
 
         ttk.Label(ioscfg, text="🆔  BundleID:").grid(row=2, column=0, sticky="e", padx=(0, 6), pady=4)
@@ -482,6 +486,13 @@ class App:
         tag = "✓" if pr["valid"] else "✗过期"
         return f"{tag} {pr['name']} · {pr['appid']} · {pr['summary']}"
 
+    def _prov_specials(self):
+        """下拉列表头部特殊选项 (label, key): 安装包自带第一, 本地选择第二"""
+        specials = [("📦 安装包自带", "embedded")]
+        if self.ios_local_prov:
+            specials.append(("📂 本地选择: " + Path(self.ios_local_prov).name, "local"))
+        return specials
+
     def refresh_ios_profiles(self):
         if not IOS:
             return
@@ -494,21 +505,14 @@ class App:
                 return
             self.ios_profiles = ps
             def upd():
-                disp = [self._ios_provision_display(pr) for pr in ps]
-                if self.ios_local_prov:
-                    disp.append("📂 本地选择: " + Path(self.ios_local_prov).name)
+                disp = [label for label, _k in self._prov_specials()]
+                disp += [self._ios_provision_display(pr) for pr in ps]
                 self.ios_prov_box.config(values=disp)
-                if ps:
-                    self.ios_prov_box.current(0)
-                    self.on_ios_provision_selected()
-                    skipped = len(total) - len(ps)
-                    self.log(f"[+] 描述文件 {len(ps)} 个可用"
-                             + (f" (已过滤 {skipped} 个无效/过期)" if skipped else "")
-                             + f", 已选: {ps[0]['name']}")
-                else:
-                    self.ios_prov_var.set("")
-                    self.log(f"[-] 无可用描述文件 (扫描到 {len(total)} 个, 全部过期或不可用); "
-                             f"可用「📂 本地」手动选")
+                skipped = len(total) - len(ps)
+                self.log(f"[+] 描述文件 {len(ps)} 个可用"
+                         + (f" (已过滤 {skipped} 个无效/过期)" if skipped else ""))
+                self.ios_prov_box.current(0)
+                self.on_ios_provision_selected()
             self.root.after(0, upd)
         threading.Thread(target=work, daemon=True).start()
 
@@ -516,13 +520,45 @@ class App:
         idx = self.ios_prov_box.current()
         if idx < 0:
             return
-        if self.ios_local_prov and idx >= len(self.ios_profiles):
-            self._apply_provision(self.ios_local_prov)
+        specials = self._prov_specials()
+        if idx < len(specials):
+            key = specials[idx][1]
+            if key == "embedded":
+                self.use_embedded_provision()
+            else:
+                self._apply_provision(self.ios_local_prov, source="📂 本地选择")
             return
-        if idx < len(self.ios_profiles):
-            self._apply_provision(self.ios_profiles[idx]["path"])
+        list_idx = idx - len(specials)
+        if list_idx < len(self.ios_profiles):
+            self._apply_provision(self.ios_profiles[list_idx]["path"])
 
-    def _apply_provision(self, path):
+    def use_embedded_provision(self):
+        """提取安装包内嵌描述文件并应用"""
+        src = self.hap_path
+        if not src:
+            self.log("[-] 请先拖入 ipa 再使用「安装包自带」")
+            self.ios_prov_var.set("")
+            return
+        p = Path(src)
+        if p.suffix.lower() != ".ipa":
+            self.log(f"[-] 安装包 {p.name} 不是 .ipa, 无内嵌描述文件")
+            self.ios_prov_var.set("")
+            return
+        try:
+            got = IOS.get_embedded_provision(p)
+        except Exception as e:
+            self.log(f"[-] 提取内嵌描述文件失败: {e}")
+            self.ios_prov_var.set("")
+            return
+        if not got:
+            self.log(f"[-] {p.name} 内没有 embedded.mobileprovision")
+            self.ios_prov_var.set("")
+            return
+        self.ios_embedded_prov = str(got)
+        self.log(f"[+] 已提取安装包内嵌描述文件: {got}")
+        self._apply_provision(str(got), source="📦 安装包自带")
+
+    def _apply_provision(self, path, source=None):
         self.ios_prov_path = path
         try:
             prov = IOS.read_mobileprovision(path)
@@ -531,7 +567,8 @@ class App:
             return
         appid = (prov.get("Entitlements") or {}).get("application-identifier", "")
         team = prov.get("TeamIdentifier")
-        self.log(f"[+] 描述文件: {IOS.provision_summary(prov)}  AppID={appid}"
+        tag = f"[{source}] " if source else ""
+        self.log(f"[+] {tag}描述文件: {IOS.provision_summary(prov)}  AppID={appid}"
                  + (f"  Team={team[0]}" if team else "")
                  + f"  设备数={len(prov.get('ProvisionedDevices') or [])}")
         bid = appid.split(".", 1)[1] if "." in appid and appid != "" else ""
@@ -540,6 +577,88 @@ class App:
             if not cur:
                 self.ios_bundle_var.set(bid)
                 self.log(f"    BundleID 建议填入: {bid}")
+
+    def current_provision_source(self):
+        """当前选中描述文件的 (显示名, 路径); 无选中返回 None"""
+        path = self.ios_prov_path
+        if not path:
+            return None
+        idx = self.ios_prov_box.current()
+        specials = self._prov_specials()
+        if 0 <= idx < len(specials):
+            return (specials[idx][0], path)
+        list_idx = idx - len(specials)
+        if 0 <= list_idx < len(self.ios_profiles):
+            return (self.ios_profiles[list_idx]["name"], path)
+        return (Path(path).name, path)
+
+    def show_ios_provision_detail(self):
+        cur = self.current_provision_source()
+        if not cur:
+            messagebox.showinfo("描述文件详情", "尚未选择描述文件")
+            return
+        disp, path = cur
+        try:
+            prov = IOS.read_mobileprovision(path)
+        except Exception as e:
+            messagebox.showerror("描述文件详情", f"解析失败: {e}\n路径: {path}")
+            return
+        ent = prov.get("Entitlements") or {}
+        exp = prov.get("ExpirationDate")
+        created = prov.get("CreationDate")
+        fmt = lambda d: d.strftime("%Y-%m-%d %H:%M") if hasattr(d, "strftime") else "—"
+        ptype = "开发 (development)" if ent.get("get-task-allow") else "发布 (distribution)"
+        teams = prov.get("TeamIdentifier") or []
+        appid = ent.get("application-identifier", "—")
+        devs = prov.get("ProvisionedDevices") or []
+        aps = ent.get("aps-environment")
+
+        win = tk.Toplevel(self.root)
+        win.title("描述文件详情")
+        win.transient(self.root)
+        win.resizable(True, True)
+        frm = ttk.Frame(win, padding=14)
+        frm.pack(fill="both", expand=True)
+        frm.columnconfigure(1, weight=1)
+
+        rows = [
+            ("名称", str(prov.get("Name", "—"))),
+            ("类型", ptype),
+            ("AppID", appid),
+            ("TeamID", ", ".join(teams) if teams else "—"),
+            ("设备数", str(len(devs))),
+            ("创建时间", fmt(created)),
+            ("到期时间", fmt(exp)),
+        ]
+        if aps:
+            rows.append(("推送环境", str(aps)))
+        for i, (k, v) in enumerate(rows):
+            ttk.Label(frm, text=f"{k}:").grid(row=i, column=0, sticky="ne", padx=(0, 10), pady=2)
+            ttk.Label(frm, text=v, wraplength=380, justify="left").grid(row=i, column=1, sticky="w", pady=2)
+        r = len(rows)
+        ttk.Label(frm, text="路径:").grid(row=r, column=0, sticky="ne", padx=(0, 10), pady=2)
+        path_lbl = ttk.Label(frm, text=str(path), wraplength=380, justify="left",
+                             style="Sub.TLabel")
+        path_lbl.grid(row=r, column=1, sticky="w", pady=2)
+
+        btns = ttk.Frame(frm)
+        btns.grid(row=r + 1, column=0, columnspan=2, sticky="we", pady=(12, 0))
+        def reveal():
+            subprocess.run(["open", "-R", str(path)])
+        def show_devices():
+            if not devs:
+                messagebox.showinfo("授权设备", "该描述文件不包含设备列表 (发布/企业类型)", parent=win)
+                return
+            top = tk.Toplevel(win)
+            top.title(f"授权设备 ({len(devs)})")
+            txt = tk.Text(top, width=44, height=min(24, 6 + len(devs)))
+            txt.pack(fill="both", expand=True, padx=8, pady=8)
+            txt.insert("1.0", "\n".join(devs))
+            txt.config(state="disabled")
+        ttk.Button(btns, text="📂 打开所在路径", command=reveal).pack(side="left")
+        if devs:
+            ttk.Button(btns, text="📱 授权设备", command=show_devices).pack(side="left", padx=(8, 0))
+        ttk.Button(btns, text="关闭", command=win.destroy).pack(side="right")
 
     def pick_ios_provision(self):
         p = filedialog.askopenfilename(
@@ -553,10 +672,11 @@ class App:
             self.log(f"[-] 描述文件解析失败: {e}")
             return
         self.ios_local_prov = p
-        disp = list(self.ios_prov_box.cget("values")) + ["📂 本地选择: " + Path(p).name]
-        self.ios_prov_box.config(values=disp)
-        self.ios_prov_box.current(len(disp) - 1)
-        self._apply_provision(p)
+        vals = [label for label, _k in self._prov_specials()]
+        vals += [self._ios_provision_display(pr) for pr in self.ios_profiles]
+        self.ios_prov_box.config(values=vals)
+        self.ios_prov_box.current(1)
+        self._apply_provision(p, source="📂 本地选择")
 
     def pick_file(self):
         ios = self.platform.get() == "ios"
@@ -639,6 +759,11 @@ class App:
             self.info.config(text=f"解析失败: {e}")
             self.log(f"[-] 解析失败: {e}")
             self.ios_meta = None
+            return
+        # 换包后「安装包自带」选中态自动重新提取
+        vals = list(self.ios_prov_box.cget("values"))
+        if vals and self.ios_prov_box.current() == 0:
+            self.use_embedded_provision()
 
     def _load_token(self):
         if H.TOKEN_FILE.exists():
@@ -770,6 +895,23 @@ class App:
             bundle_override = self.ios_bundle_var.get().strip() or None
             self.log(f"=== iOS 开始: {src.name} | 证书 {identity[:60]} | "
                      f"描述文件 {'有' if prov else '无'} ===")
+
+            # profile 兼容性预检: 固定 bundle id 的 profile 与设备上已装的同名应用
+            # (通配 entitlement) 会冲突, 报 MismatchedApplicationIdentifierEntitlement
+            if prov and src.suffix == ".ipa":
+                try:
+                    with tempfile.TemporaryDirectory(prefix="iosgui_pre_") as _td:
+                        _app = IOS.extract_ipa(src, _td, keep_signature=True)
+                        pkg_bid = IOS.read_bundle_id(_app)
+                    prov_appid = (IOS.read_mobileprovision(prov).get("Entitlements") or {}) \
+                        .get("application-identifier", "")
+                    prof_bid = prov_appid.split(".", 1)[1] if "." in prov_appid else ""
+                    if prof_bid and "*" not in prof_bid and pkg_bid and prof_bid != pkg_bid:
+                        self.log(f"[!] 注意: 描述文件绑定 bundle id '{prof_bid}', "
+                                 f"与包内 '{pkg_bid}' 不同; 签名后包将变为 '{prof_bid}'. "
+                                 f"若设备上已装旧版, 建议先卸载或改用通配 profile")
+                except Exception:
+                    pass
 
             workdir = Path.home() / "Library/Caches/hap_installer/gui"
             workdir.mkdir(parents=True, exist_ok=True)

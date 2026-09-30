@@ -24,6 +24,46 @@ python3 ios_sign.py install out.ipa       # devicectl 安装到已连接设备
 python3 ios_sign.py launch com.foo.bar
 ```
 
+### 描述文件三种来源（GUI 描述文件下拉框）
+
+1. **📦 安装包自带**（默认第一项）——自动提取 ipa 内 `embedded.mobileprovision`，缓存于
+   `~/Library/Caches/hap_installer/embedded_prov/`；换包后自动重新提取
+2. **📂 本地选择**（第二项）——点「📂 本地」按钮弹文件框自选 `.mobileprovision`
+3. **本机扫描**——Xcode/MobileDevice 目录中的描述文件列表
+
+选中任意描述文件后点 **ℹ️ 详情**：名称/类型/AppID/TeamID/设备数/有效期/路径，
+支持 **📂 打开所在路径**（Finder 定位）与 **📱 授权设备**（UDID 列表）。
+
+### 重签名规则（关键，勿改）
+
+依据 Apple 官方文档《Creating distribution-signed code》《Using the latest code signature format》与 TN2206：
+
+- **嵌套代码（Frameworks/PlugIns/XPCServices）逐个先签，主包最后签**（inside-out）；
+  不用 `--deep`（对嵌套代码套用同一签名参数，且漏签非标准位置代码）
+- **不启用 Hardened Runtime**（不加 `--options runtime`）：加固壳处理过的二进制在
+  runtime 严格页校验下会被 iOS 内核 spawn 阶段直接拒绝（`EBADMACHO`，error 88
+  "Malformed Mach-o file"），CD version 也会被升到 0x20500
+- **entitlements 白名单精简**：只保留 `application-identifier`、`team-identifier`、
+  `get-task-allow`、`keychain-access-groups`。profile 允许 ≠ app 可声明——声明
+  `com.apple.security.hardened-process.*` 等变体而 CD flags 未启用 runtime，
+  内核校验状态自相矛盾，同样 EBADMACHO。需要额外 entitlement 用 `-e key=value` 显式追加
+- 未指定 `-p` 描述文件时，自动回退用包内 `embedded.mobileprovision` 生成 entitlements
+  （否则缺 `application-identifier` → 安装报 0xe8008015）
+- `install` 安装前扫描未签名嵌套组件（如壳厂漏签的 framework），发现即自动重签再装
+  （修复 `0xe800801c No code signature found`）
+
+### 兼容性备忘（真机排障记录 2026-09）
+
+| 现象 | 原因 | 处置 |
+|---|---|---|
+| 安装报 `0xe800801c No code signature found` | 壳厂漏签某个嵌套 framework | `install` 已自动重签 |
+| 安装报 `0xe8008015 A valid provisioning profile...not found` | entitlements 缺 `application-identifier` | 已修复：fallback 内嵌 profile |
+| 启动即死 `spawn error 88 Malformed Mach-o file` | `--options runtime`（CD flags 0x10000）或冗余 hardened-process entitlements 与壳包二进制不兼容 | 已修复：无 runtime + entitlements 白名单 |
+| 安装报 `MismatchedApplicationIdentifierEntitlement` | 固定 bundle id 的 profile 与设备上已装旧版冲突 | GUI 预检告警；卸载旧版或换通配 profile |
+
+验证基线：加固包（BBSCRUtility 壳）/ 无壳原包 / 标准 Xcode 构建三.ipa 重签后
+真机（iPhone 13, iOS 26）安装+启动全部通过。
+
 ## 目录
 
 | 文件 | 说明 |
@@ -32,7 +72,6 @@ python3 ios_sign.py launch com.foo.bar
 | `hap_gui.py` | 图形界面（tkinter + tkinterdnd2，拖拽，鸿蒙/iOS 双平台） |
 | `ios_sign.py` | iOS 签名 CLI/库（codesign 重签名 + devicectl 安装） |
 | `hap_sniff.py` | 本地 MITM 代理，抓取 app 对华为云的真实请求 |
-| `sdp_proxy_demo.py` | SDP 网络代理 demo（复刻客户 App 内置 `@zzy/sdp` VPN 隧道代理行为） |
 | `run_gui.command` | 双击启动 GUI |
 | `run_capture.sh` | 一键抓包（信任 CA + 起代理 + 起 app） |
 | `packaging/` | 打包为 `.dmg`（PyInstaller）、签名/公证脚本 |

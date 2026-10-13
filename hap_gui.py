@@ -54,7 +54,7 @@ DEFAULT_TEAMS = [
     ("企业 · 北京梆梆安全科技有限公司 (只读,禁止增删)", "30086000687991714"),
 ]
 
-APP_VERSION = "0.4.3"
+APP_VERSION = "0.4.4"
 
 CLI_COMMANDS = {
     "info", "sig", "sign", "verify", "genkeys", "signprofile",

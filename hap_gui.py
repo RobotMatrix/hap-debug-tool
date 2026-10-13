@@ -54,6 +54,8 @@ DEFAULT_TEAMS = [
     ("企业 · 北京梆梆安全科技有限公司 (只读,禁止增删)", "30086000687991714"),
 ]
 
+APP_VERSION = "0.4.3"
+
 CLI_COMMANDS = {
     "info", "sig", "sign", "verify", "genkeys", "signprofile",
     "devices", "connect", "shell", "udid", "apps",
@@ -116,7 +118,7 @@ def sig_summary(info):
 class App:
     def __init__(self, root):
         self.root = root
-        root.title("HAP 调试助手")
+        root.title(f"HAP 调试助手 v{APP_VERSION}")
         root.geometry("800x660")
         root.minsize(700, 580)
         self.logq = queue.Queue()
@@ -319,7 +321,7 @@ class App:
         ttk.Button(outrow, text="📂 打开目录", command=self.reveal_out).pack(side="right")
         ttk.Button(outrow, text="📋 复制路径", command=self.copy_out).pack(side="right", padx=4)
 
-        logf = ttk.LabelFrame(outer, text=" 📜  日志 ", padding=4)
+        logf = ttk.LabelFrame(outer, text=f" 📜  日志  ·  v{APP_VERSION} ", padding=4)
         logf.pack(fill="both", expand=True, pady=(8, 0))
         self.logbox = tk.Text(logf, height=10, bg=self.box_bg, fg=self.box_fg,
                               insertbackground=self.box_fg, font=self.f_mono,

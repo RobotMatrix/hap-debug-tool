@@ -100,19 +100,28 @@ jobs:
           ./packaging/sign_notarize.sh --identity "$IDENTITY" --profile hap-notary
 
       - name: Rename artifact
+        env:
+          REF: ${{ github.ref_name }}
         run: |
-          cp "packaging/HAP调试助手.dmg" "packaging/HAP-debug-tool.dmg"
+          VERSION="${REF#v}"
+          if [ "$VERSION" != "$REF" ]; then
+            DMG_NAME="HAP-debug-tool-${VERSION}.dmg"
+          else
+            DMG_NAME="HAP-debug-tool-${REF}.dmg"
+          fi
+          echo "DMG_NAME=$DMG_NAME" >> "$GITHUB_ENV"
+          cp "packaging/HAP调试助手.dmg" "packaging/$DMG_NAME"
           ls -la packaging/*.dmg
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
           name: HAP-debug-tool-dmg
-          path: packaging/HAP-debug-tool.dmg
+          path: packaging/${{ env.DMG_NAME }}
           if-no-files-found: error
 
       - name: Attach to release
         if: startsWith(github.ref, 'refs/tags/')
         uses: softprops/action-gh-release@v2
         with:
-          files: packaging/HAP-debug-tool.dmg
+          files: packaging/${{ env.DMG_NAME }}

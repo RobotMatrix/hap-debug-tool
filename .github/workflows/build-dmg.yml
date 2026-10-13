@@ -34,16 +34,26 @@ jobs:
         env:
           HAP_TOOLS_URL: ${{ secrets.HAP_TOOLS_URL }}
           HAP_TOOLS_B64: ${{ secrets.HAP_TOOLS_B64 }}
+          HAP_TOOLS_ENC_PASS: ${{ secrets.HAP_TOOLS_ENC_PASS }}
         run: |
           mkdir -p packaging/tools
-          if [ -n "$HAP_TOOLS_URL" ]; then
-            echo "从 HAP_TOOLS_URL 下载工具..."
-            curl -fsSL "$HAP_TOOLS_URL" | tar -xzf - -C packaging/tools
+          if [ -n "$HAP_TOOLS_URL" ] && [ -n "$HAP_TOOLS_ENC_PASS" ]; then
+            echo "从 HAP_TOOLS_URL 下载加密工具包并解密..."
+            curl -fsSL "$HAP_TOOLS_URL" -o /tmp/hap-tools.enc
+            openssl enc -d -aes-256-cbc -pbkdf2 -iter 100000 \
+              -in /tmp/hap-tools.enc -out /tmp/hap-tools.tar.gz \
+              -pass "pass:$HAP_TOOLS_ENC_PASS"
+            tar -xzf /tmp/hap-tools.tar.gz -C packaging/tools
+            rm -f /tmp/hap-tools.enc /tmp/hap-tools.tar.gz
           elif [ -n "$HAP_TOOLS_B64" ]; then
             echo "$HAP_TOOLS_B64" | base64 --decode | tar -xzf - -C packaging/tools
+          elif [ -n "$HAP_TOOLS_URL" ]; then
+            echo "从 HAP_TOOLS_URL 下载工具 (未加密)..."
+            curl -fsSL "$HAP_TOOLS_URL" | tar -xzf - -C packaging/tools
           else
-            echo "::warning title=缺少工具::未配置 secrets.HAP_TOOLS_URL/B64，dmg 不含内置 hdc/signer/key.pem"
+            echo "::warning title=缺少工具::未配置 secrets.HAP_TOOLS_URL(+ENC_PASS)/B64，dmg 不含内置 hdc/signer/key.pem"
           fi
+          ls -la packaging/tools/ 2>/dev/null || true
 
       - name: Build dmg (未签名)
         run: |

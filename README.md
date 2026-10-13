@@ -92,6 +92,23 @@ python3 hap_cli.py cloud token-check        # 检查 token 是否过期 (exit 2=
 python3 hap_cli.py cloud --help          # 云接口(证书/Profile)
 ```
 
+## debug 标志对齐与签名预检（release 包重签为调试包）
+
+签名时（`sign` / `install`）自动做两件事（`--no-set-debug` 关闭）：
+
+1. **app.debug 对齐**：profile `type=debug` 而 HAP `module.json` 的 `app.debug=false`
+   （release 构建）时，自动原地改写 `app.debug=true` 后再签——否则设备端报
+   debug 信息不一致拒装。`type=release/distribution` 则反向对齐为 false。
+2. **预检告警**：profile `bundle-name` 与 HAP `bundleName` 不一致时告警
+   （该组合安装必失败，bm 校验拒绝；需用正确包名重新走 `cloud flow`）。
+
+单独改写（不签名）：
+
+```bash
+python3 hap_cli.py set-debug entry-default.hap true    # 单 HAP
+python3 hap_cli.py set-debug MyApp.app false           # App Pack 内所有模块
+```
+
 ## 一键签名安装流程
 
 ```

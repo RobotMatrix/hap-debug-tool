@@ -494,9 +494,159 @@ def app_pack_module_files(app_path):
     return mods
 
 
+# --------------------------------------------------------------------------- #
+# module.json debug 标志对齐 + 签名预检
+# --------------------------------------------------------------------------- #
+def read_profile_info(p7b):
+    """解析 p7b 内嵌的 profile JSON。失败返回 None。"""
+    try:
+        data = Path(p7b).read_bytes()
+    except OSError:
+        return None
+    i = data.find(b'{"version-name"')
+    if i < 0:
+        return None
+    obj = _extract_json_obj(data, i)
+    if not obj:
+        return None
+    try:
+        return json.loads(obj.decode("utf-8", "replace"))
+    except Exception:
+        return None
+
+
+def _rewrite_zip_entry(hap, entry_name, new_data):
+    """原地重写 zip 内单个 entry (其余 entry 原样复制，保留压缩方式/属性)。"""
+    src = Path(hap)
+    tmp = src.with_name(src.name + ".rezip.tmp")
+    with zipfile.ZipFile(src) as zin, zipfile.ZipFile(tmp, "w") as zout:
+        for info in zin.infolist():
+            data = new_data if info.filename == entry_name else zin.read(info.filename)
+            zi = zipfile.ZipInfo(info.filename, date_time=info.date_time)
+            zi.compress_type = info.compress_type
+            zi.external_attr = info.external_attr
+            zout.writestr(zi, data)
+    os.replace(str(tmp), str(src))
+
+
+def _read_hap_app_flags(hap):
+    """读取 HAP 的 (bundleName, app.debug)。无 module.json 返回 (None, None)。"""
+    try:
+        with zipfile.ZipFile(hap) as z:
+            if "module.json" not in z.namelist():
+                return None, None
+            mj = json.loads(z.read("module.json").decode("utf-8"))
+    except Exception:
+        return None, None
+    app = mj.get("app", {})
+    return app.get("bundleName"), bool(app.get("debug"))
+
+
+def set_hap_debug(hap, debug=True):
+    """改写 HAP 内 module.json 的 app.debug 标志 (原地)。返回 (changed, old, new)。"""
+    with zipfile.ZipFile(hap) as z:
+        names = z.namelist()
+        if "module.json" not in names:
+            raise SystemExit(f"{hap} 中没有 module.json")
+        mj = json.loads(z.read("module.json").decode("utf-8"))
+    old = bool(mj.get("app", {}).get("debug"))
+    if old == bool(debug):
+        return False, old, old
+    mj.setdefault("app", {})["debug"] = bool(debug)
+    _rewrite_zip_entry(hap, "module.json",
+                       json.dumps(mj, ensure_ascii=False, indent=2).encode("utf-8"))
+    return True, old, bool(debug)
+
+
+def _hap_debug_want(profile):
+    """根据 profile type 推断 app.debug 应为 true/false。无法判断返回 None。"""
+    prof = read_profile_info(profile)
+    ptype = (prof or {}).get("type")
+    if ptype == "debug":
+        return True
+    if ptype in ("release", "distribution"):
+        return False
+    return None
+
+
+def align_hap_debug_with_profile(hap, profile, mode="auto"):
+    """按 profile 类型原地改写 HAP 的 app.debug。mode: auto/force/never。
+
+    返回是否发生了修改。profile type=debug -> true; release/distribution -> false。
+    """
+    if mode == "never":
+        return False
+    want = True if mode == "force" else _hap_debug_want(profile)
+    if want is None:
+        return False
+    _, old = _read_hap_app_flags(hap)
+    if old is None or old == want:
+        return False
+    changed, o, n = set_hap_debug(hap, want)
+    if changed:
+        Log.warn(f"已改写 {Path(hap).name}: app.debug {o} -> {n} "
+                 f"(与 {Path(profile).name} 的 profile type 对齐)")
+    return changed
+
+
+def preflight_sign_check(hap, profile):
+    """签名前检查 profile 与 HAP 的匹配性，返回问题描述列表。"""
+    problems = []
+    prof = read_profile_info(profile)
+    if not prof:
+        return problems
+    p_bundle = (prof.get("bundle-info") or {}).get("bundle-name")
+    p_type = prof.get("type")
+    h_bundle, h_debug = _read_hap_app_flags(hap)
+    if p_bundle and h_bundle and p_bundle != h_bundle:
+        problems.append(
+            f"Profile bundle-name ({p_bundle}) 与 HAP bundleName ({h_bundle}) 不一致 "
+            f"-> 安装必失败 (bm 校验拒绝)。请为 {h_bundle} 申请匹配的调试 Profile:\n"
+            f"    python3 hap_cli.py cloud flow --bundle-name {h_bundle} --cert-name <证书名> "
+            f"--team-id <团队ID> --token <oauth2token>")
+    if p_type == "debug" and h_debug is False:
+        problems.append(
+            "HAP 为 release 构建 (app.debug=false) 但 profile type=debug -> "
+            "设备端报 debug 信息不一致。签名时将自动改写 app.debug=true。")
+    return problems
+
+
+def set_app_pack_debug(app_path, debug=True):
+    """对 App Pack(.app 目录或 zip) 内所有模块改写 app.debug。返回修改的模块数。"""
+    p = Path(app_path)
+    if p.is_dir():
+        changed = 0
+        for f in app_pack_module_files(p):
+            c, _, _ = set_hap_debug(f, debug)
+            changed += 1 if c else 0
+        return changed
+    # zip 形式: 解包 -> 逐模块改写 -> 按原条目顺序/压缩方式重新打包
+    tmp = p.with_name(p.name + ".rezip.tmp")
+    changed = 0
+    with tempfile.TemporaryDirectory(prefix="happack_dbg_") as td:
+        with zipfile.ZipFile(p) as z:
+            z.extractall(td)
+            order = z.infolist()
+        for f in app_pack_module_files(td):
+            c, _, _ = set_hap_debug(f, debug)
+            changed += 1 if c else 0
+        with zipfile.ZipFile(tmp, "w") as zout:
+            for info in order:
+                zi = zipfile.ZipInfo(info.filename, date_time=info.date_time)
+                zi.compress_type = info.compress_type
+                zi.external_attr = info.external_attr
+                with open(os.path.join(td, info.filename), "rb") as fh:
+                    zout.writestr(zi, fh.read())
+    os.replace(str(tmp), str(p))
+    return changed
+
+
 def sign_app_pack(t, app_path, out_dir, keystore, keystore_pwd, key_alias,
-                  app_cert, profile, sign_alg="SHA256withECDSA"):
-    """重签名 App Pack(.app 目录或 zip) 内所有 .hap/.hsp 模块，输出 {name}-signed.app。"""
+                  app_cert, profile, sign_alg="SHA256withECDSA", set_debug="auto"):
+    """重签名 App Pack(.app 目录或 zip) 内所有 .hap/.hsp 模块，输出 {name}-signed.app。
+
+    set_debug: auto=按 profile 类型自动对齐 app.debug / force=强制 true / never=不改。
+    """
     src = Path(app_path)
     if not is_app_pack(app_path):
         raise SystemExit(f"不是有效的 App Pack: {app_path}")
@@ -521,7 +671,7 @@ def sign_app_pack(t, app_path, out_dir, keystore, keystore_pwd, key_alias,
     for f in modules:
         tmp = f.with_name(f.stem + ".signed" + f.suffix)
         do_sign(t, str(f), str(tmp), keystore, keystore_pwd, key_alias,
-                app_cert, profile, sign_alg)
+                app_cert, profile, sign_alg, set_debug=set_debug)
         os.replace(str(tmp), str(f))
     Log.ok(f"App Pack 已重签名 -> {dest}")
     return str(dest)
@@ -553,9 +703,12 @@ def cmd_info(args):
 # 签名
 # --------------------------------------------------------------------------- #
 def do_sign(t, hap, out, keystore, keystore_pwd, key_alias, app_cert, profile,
-            sign_alg="SHA256withECDSA", extra=None):
+            sign_alg="SHA256withECDSA", extra=None, set_debug="auto"):
     signer = t.tool("signer")
     keystore_pwd = keystore_pwd or DEFAULT_KEYSTORE_PWD
+    align_hap_debug_with_profile(hap, profile, set_debug)
+    for p in preflight_sign_check(hap, profile):
+        Log.warn(p)
     cmd = [
         signer, "sign-app",
         "-mode", "localSign",
@@ -632,13 +785,15 @@ def cmd_sign(args):
     if not os.path.exists(src):
         raise SystemExit(f"文件不存在: {src}")
     keystore, pwd, alias, cert, profile = resolve_sign_args(t, args)
+    set_debug = "never" if getattr(args, "no_set_debug", False) else "auto"
     if is_app_pack(src):
         out_dir = args.out or os.path.dirname(os.path.abspath(src))
-        sign_app_pack(t, src, out_dir, keystore, pwd, alias, cert, profile, args.sign_alg)
+        sign_app_pack(t, src, out_dir, keystore, pwd, alias, cert, profile, args.sign_alg,
+                      set_debug=set_debug)
         return
     hap = resolve_hap(src)
     out = args.out or os.path.splitext(src)[0] + "-signed.hap"
-    do_sign(t, hap, out, keystore, pwd, alias, cert, profile, args.sign_alg)
+    do_sign(t, hap, out, keystore, pwd, alias, cert, profile, args.sign_alg, set_debug=set_debug)
 
 
 def cmd_verify(args):
@@ -656,6 +811,19 @@ def cmd_verify(args):
     if os.path.exists(profile):
         Log.ok(f"Profile: {profile}")
     raise SystemExit(rc)
+
+
+def cmd_set_debug(args):
+    target = args.target
+    debug = args.state == "true"
+    if not os.path.exists(target):
+        raise SystemExit(f"文件不存在: {target}")
+    if is_app_pack(target):
+        n = set_app_pack_debug(target, debug)
+        Log.ok(f"App Pack 内 {n} 个模块 app.debug -> {debug}")
+        return
+    changed, old, new = set_hap_debug(target, debug)
+    Log.ok(f"{Path(target).name}: app.debug {old} -> {new}" + ("" if changed else " (无变化)"))
 
 
 def cmd_genkeys(args):
@@ -864,16 +1032,19 @@ def cmd_install(args):
 
     # 1. 可选签名
     sign_one = None
+    set_debug = "never" if getattr(args, "no_set_debug", False) else "auto"
     if args.no_sign:
         signed = hap
     else:
         signed = args.out or os.path.splitext(src)[0] + "-signed.hap"
         keystore, pwd, alias, cert, profile = resolve_sign_args(t, args)
-        do_sign(t, hap, signed, keystore, pwd, alias, cert, profile, args.sign_alg)
+        do_sign(t, hap, signed, keystore, pwd, alias, cert, profile, args.sign_alg,
+                set_debug=set_debug)
 
         def sign_one(src, outname):
             dst = os.path.join(tempfile.gettempdir(), outname)
-            do_sign(t, src, dst, keystore, pwd, alias, cert, profile, args.sign_alg)
+            do_sign(t, src, dst, keystore, pwd, alias, cert, profile, args.sign_alg,
+                    set_debug=set_debug)
             return dst
 
     # 2. 安装
@@ -890,12 +1061,14 @@ def cmd_install(args):
 
 def _install_app_pack(t, h, src, args):
     """重签名并安装 App Pack(.app)：hap + hsp 需同时安装。"""
+    set_debug = "never" if getattr(args, "no_set_debug", False) else "auto"
     if args.no_sign:
         modules = app_pack_module_files(src)
     else:
         keystore, pwd, alias, cert, profile = resolve_sign_args(t, args)
         out_dir = os.path.dirname(os.path.abspath(args.out)) if args.out else tempfile.mkdtemp(prefix="happack_sign_")
-        signed = sign_app_pack(t, src, out_dir, keystore, pwd, alias, cert, profile, args.sign_alg)
+        signed = sign_app_pack(t, src, out_dir, keystore, pwd, alias, cert, profile, args.sign_alg,
+                               set_debug=set_debug)
         modules = app_pack_module_files(signed)
     print("安装模块: " + ", ".join(os.path.basename(m) for m in modules))
     rc, out = h.install_packages(modules, replace=True)
@@ -1427,6 +1600,8 @@ def build_parser():
         sp.add_argument("--app-cert", help="app 证书 (.cer)")
         sp.add_argument("--profile", help="profile (.p7b)")
         sp.add_argument("--sign-alg", default="SHA256withECDSA")
+        sp.add_argument("--no-set-debug", action="store_true",
+                        help="不自动按 profile 类型改写 module.json app.debug")
 
     sp = sub.add_parser("info", help="解析 HAP/HSP 元信息")
     sp.add_argument("hap")
@@ -1447,6 +1622,11 @@ def build_parser():
     sp = sub.add_parser("verify", help="验签 HAP")
     sp.add_argument("hap")
     sp.set_defaults(func=cmd_verify)
+
+    sp = sub.add_parser("set-debug", help="改写 HAP/App Pack 内 module.json app.debug (原地)")
+    sp.add_argument("target")
+    sp.add_argument("state", nargs="?", default="true", choices=["true", "false"])
+    sp.set_defaults(func=cmd_set_debug)
 
     sp = sub.add_parser("genkeys", help="生成自签名 CA + app/profile 证书")
     sp.add_argument("-o", "--out-dir", default="hap_keys")

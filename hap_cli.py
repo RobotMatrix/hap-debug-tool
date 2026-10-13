@@ -725,10 +725,20 @@ def do_sign(t, hap, out, keystore, keystore_pwd, key_alias, app_cert, profile,
         cmd += extra
     rc, outp = run(cmd, check=False, capture=True)
     low = (outp or "").lower()
-    if rc != 0 or "sign-app success" not in low or not os.path.exists(out):
+    ok = (rc == 0 and "sign-app success" in low
+          and os.path.exists(out) and b"<hap sign block>" in Path(out).read_bytes()[-1024*1024*2:])
+    if not ok:
+        try:
+            os.unlink(out)
+        except OSError:
+            pass
         Log.err("签名失败：")
         print((outp or "").rstrip())
-        raise SystemExit(rc or 1)
+        if "ECDSA verification failure" in (outp or ""):
+            Log.err("私钥 (keystore) 与 app 证书不配对。该证书不是由本工具 CSR (auto.csr) "
+                    "签发的，无法用内置 key.pem 签名。请删除该证书后重新申请，"
+                    "或在签名时指定与证书匹配的私钥。")
+        raise RuntimeError(f"签名失败 (signer rc={rc})，见上方 signer 输出")
     print(outp.rstrip())
     Log.ok(f"已签名 -> {out}")
     return out
@@ -1346,6 +1356,191 @@ def download(url, dest):
     return False
 
 
+def _parse_openssl_dates(output):
+    dates = {}
+    for line in (output or "").splitlines():
+        if "=" in line:
+            k, v = line.split("=", 1)
+            dates[k.strip()] = v.strip()
+    nb, na = dates.get("notBefore"), dates.get("notAfter")
+    ts = None
+    if na:
+        try:
+            from datetime import datetime, timezone
+            ts = datetime.strptime(na, "%b %d %H:%M:%S %Y %Z").replace(tzinfo=timezone.utc).timestamp()
+        except Exception:
+            ts = None
+    return nb, na, ts
+
+
+def _x509_field(cert_pem, *opts):
+    fd, tmp = tempfile.mkstemp(prefix="certchk_", suffix=".pem")
+    try:
+        with os.fdopen(fd, "wb") as f:
+            f.write(cert_pem)
+        r = subprocess.run(["openssl", "x509", "-noout", *opts, "-in", tmp],
+                           capture_output=True, text=True, timeout=15)
+        return (r.stdout or "").strip()
+    except Exception:
+        return ""
+    finally:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+
+
+def cert_expiry_from_pem(pem_bytes):
+    """解析证书链 PEM，取叶子证书 (签名对象) 的有效期。
+
+    华为云下发的 .cer 通常是 RootCA -> 中间CA -> 叶子证书 三张串联，
+    openssl x509 只读第一张 (RootCA, 长期有效) 会误判。叶子证书特征:
+    issuer != subject (非自签) 且 CN 含 Development/Distribution。
+    返回 (not_before_str, not_after_str, not_after_ts)。失败返回 (None, None, None)。
+    """
+    if isinstance(pem_bytes, str):
+        pem_bytes = pem_bytes.encode("utf-8", "replace")
+    blocks = re.findall(
+        r"-----BEGIN CERTIFICATE-----.*?-----END CERTIFICATE-----",
+        pem_bytes.decode("utf-8", "replace"), re.S)
+    if not blocks:
+        # 整体按单张 DER/PEM 试一次
+        single = _x509_field(pem_bytes, "-startdate", "-enddate")
+        return _parse_openssl_dates(single)
+    leaf = None
+    for b in blocks:
+        subject = _x509_field(b.encode(), "-subject")
+        issuer = _x509_field(b.encode(), "-issuer")
+        # 叶子证书: 被别人签发 (issuer != subject)
+        if subject and issuer and subject != issuer:
+            leaf = b
+            # 优先 CN 带 Development/Distribution 的
+            if "Development" in subject or "Distribution" in subject:
+                break
+    if not leaf:
+        leaf = blocks[-1]
+    dates = _x509_field(leaf.encode(), "-startdate", "-enddate")
+    return _parse_openssl_dates(dates)
+
+
+def check_cert_usable(cert_id, cert_object_id, headers, download_fn=None):
+    """reapply 下载证书并检查有效期。返回 (usable, detail, pem_bytes)。
+
+    过期/无法判定均视为不可用 (False)，detail 说明原因。
+    """
+    dl = download_fn or download
+    rp, _ = http_req(URL_OBJECT_REAPPLY, "POST", headers, {"sourceUrls": cert_object_id})
+    info = (rp or {}).get("urlsInfo", [{}])[0] or {}
+    url = info.get("newUrl")
+    if not url:
+        return False, f"reapply 未返回下载地址: {rp}", b""
+    import gzip as _gzip
+    req = urllib.request.Request(url, headers={"user-agent": "Dart/3.6 (dart:io)"})
+    try:
+        with urllib.request.urlopen(req, timeout=60) as resp:
+            raw = resp.read()
+            if "gzip" in (resp.headers.get("Content-Encoding") or "").lower():
+                raw = _gzip.decompress(raw)
+    except Exception as e:
+        return False, f"证书下载失败: {e}", b""
+    nb, na, ts = cert_expiry_from_pem(raw)
+    if not na:
+        return False, "证书解析失败 (非 PEM/DER x509)", raw
+    now = time.time()
+    if ts and ts < now:
+        return False, f"证书已过期 ({na})", raw
+    return True, f"有效期至 {na}", raw
+
+
+def _pick_fallback_cert(certs, headers, logger=None, keystore=None, tools=None):
+    """配额已满时的回退选择: 遍历候选证书，验有效期 + 验与 keystore 私钥配对，返回第一个可用证书。
+
+    华为云证书按 CSR 签发，只有用本工具 CSR (auto.csr/xiaobai.csr) 申请的证书才能配内置 key.pem；
+    配对失败会一路走通云流程后在签名时才炸 (ECDSA verification failure)，此处提前拦截。
+    无可用证书时列出候选清单与处置建议并返回 None。
+    """
+    say = logger or (lambda m: Log.warn(m))
+    by_name = {c.get("certName"): c for c in certs}
+    ordered = ([by_name[n] for n in ("auto-debug", "xiaobai-debug") if n in by_name]
+               + [c for c in certs if c.get("certName") not in ("auto-debug", "xiaobai-debug")])
+    unusable = []
+    for c in ordered:
+        ok, why, pem = check_cert_usable(c.get("id"), c.get("certObjectId"), headers)
+        if not ok:
+            unusable.append((c, why))
+            say(f"   候选 '{c.get('certName')}' (id={c.get('id')}) 不可用: {why}")
+            continue
+        if keystore:
+            pair_ok, pair_why = verify_key_cert_pair(pem, keystore, tools)
+            if not pair_ok:
+                unusable.append((c, pair_why))
+                say(f"   候选 '{c.get('certName')}' (id={c.get('id')}) 不可用: {pair_why}")
+                continue
+            why += f"; {pair_why}"
+        say(f"   配额已满 -> 回退复用 '{c.get('certName')}' ({why})")
+        return c
+    say("   所有候选证书均不可用 (过期/与内置私钥不配对/下载失败)。请删除过期或不配对的证书腾出配额后重试:")
+    for c, _ in unusable:
+        say(f"     python3 hap_cli.py cloud cert-delete --cert-ids {c.get('id')} "
+            f"--team-id <团队ID> --token <TOKEN>   # {c.get('certName')}")
+    return None
+
+
+def verify_key_cert_pair(cert_pem, keystore, tools=None):
+    """验证 keystore 私钥与证书是否配对 (openssl 公钥比对)。证书 PEM 可能是完整链。"""
+    if isinstance(cert_pem, str):
+        cert_pem = cert_pem.encode("utf-8", "replace")
+    blocks = re.findall(r"-----BEGIN CERTIFICATE-----.*?-----END CERTIFICATE-----",
+                        cert_pem.decode("utf-8", "replace"), re.S)
+    fd, kf = tempfile.mkstemp(prefix="pairk_", suffix=".pem")
+    try:
+        shutil.copy(keystore, kf)
+        r2 = subprocess.run(["openssl", "pkey", "-in", kf, "-pubout"],
+                            capture_output=True, text=True)
+        k2 = "".join(r2.stdout.split()) if r2.returncode == 0 else ""
+        if not k2:
+            return True, "(私钥解析失败, 跳过配对检查)"
+        cands = blocks if blocks else [cert_pem.decode("utf-8", "replace")]
+        for b in cands:
+            fd2, cf = tempfile.mkstemp(prefix="pairc_", suffix=".pem")
+            try:
+                with os.fdopen(fd2, "wb") as f:
+                    f.write(b.encode())
+                r1 = subprocess.run(["openssl", "x509", "-in", cf, "-pubkey", "-noout"],
+                                    capture_output=True, text=True)
+            finally:
+                try:
+                    os.unlink(cf)
+                except OSError:
+                    pass
+            if r1.returncode != 0:
+                continue
+            k1 = "".join(r1.stdout.split())
+            if k1 == k2:
+                return True, "与内置私钥配对"
+        if not blocks:
+            return True, "(证书解析失败, 跳过配对检查)"
+        return False, ("与内置私钥 (key.pem) 不配对 (公钥不一致): "
+                       "该证书非本工具 CSR (auto.csr) 签发，需删除后重新申请或提供匹配私钥")
+    finally:
+        try:
+            os.unlink(kf)
+        except OSError:
+            pass
+
+
+DEFAULT_CSR_FILES = ("auto.csr", "xiaobai.csr")
+
+
+def find_csr(t):
+    """按顺序查找内置 CSR: auto.csr -> xiaobai.csr (向后兼容旧安装)。"""
+    for name in DEFAULT_CSR_FILES:
+        p = t.store_file(name, required=False)
+        if p:
+            return p
+    raise SystemExit(f"找不到内置 CSR ({' / '.join(DEFAULT_CSR_FILES)})，用 --csr 指定。")
+
+
 def cmd_cloud(args):
     sub = args.cloud_cmd
     if sub == "login":
@@ -1431,9 +1626,13 @@ def _cloud_flow(args, H):
             cert = next((c for c in certs if c.get("certName") == args.cert_name), None)
         else:
             Log.warn(f"   申请失败: {(r or {}).get('ret', {}).get('msg')}")
-            cert = next((c for c in certs if c.get("certName") == "xiaobai-debug"), None)
-            if cert:
-                Log.warn("   配额已满 -> 回退复用 'xiaobai-debug'")
+            t = Tools(args.app, args.tools)
+            keystore = None
+            try:
+                keystore = t.store_file("key.pem", required=False)
+            except SystemExit:
+                keystore = None
+            cert = _pick_fallback_cert(certs, H, keystore=keystore, tools=t)
     if not cert:
         Log.err(f"   找不到证书 '{args.cert_name}' (可加 --create-cert 申请)。现有: " +
                 ", ".join(c.get("certName", "?") for c in certs))

@@ -1234,7 +1234,11 @@ def hw_headers(token=None, uid=None, team=None, jwt=None, refresh=None):
     return h
 
 
-def http_req(url, method="GET", headers=None, body=None):
+class CloudAuthError(RuntimeError):
+    """华为云请求返回 401/403 (token 过期/无效)。"""
+
+
+def http_req(url, method="GET", headers=None, body=None, _top=True):
     import gzip as _gzip
     h = dict(headers or {})
     data = None
@@ -1249,6 +1253,8 @@ def http_req(url, method="GET", headers=None, body=None):
     except urllib.error.HTTPError as e:
         raw = e.read()
         Log.err(f"HTTP {e.code} {url}")
+        if e.code in (401, 403):
+            raise CloudAuthError(f"HTTP {e.code} (token 过期/无效): {url}")
         return None, raw
     except Exception as e:
         Log.err(f"请求失败: {e}")
@@ -1592,7 +1598,12 @@ def cmd_cloud(args):
         j, _ = http_req(URL_CERT_DELETE, "POST", H, {"certIds": args.cert_ids})
         print(json.dumps(j, ensure_ascii=False, indent=2))
     elif sub == "flow":
-        _cloud_flow(args, H)
+        try:
+            _cloud_flow(args, H)
+        except CloudAuthError as e:
+            Log.err(f"Token 已过期/无效: {e}")
+            Log.err("请重新登录获取 oauth2token: hap_cli.py cloud login 或重新抓包")
+            raise SystemExit(2)
     else:
         raise SystemExit(f"未知 cloud 子命令: {sub}")
 
@@ -1620,7 +1631,7 @@ def _cloud_flow(args, H):
         Log.info(f"   证书 '{args.cert_name}' 不存在, 申请中 (csr={csr_path})")
         r, _ = http_req(URL_CERT_ADD, "POST", H, {
             "certName": args.cert_name, "certType": 1, "csr": Path(csr_path).read_text()})
-        if (r or {}).get("ret", {}).get("code") in (0, None):
+        if r is not None and (r or {}).get("ret", {}).get("code") in (0, None):
             cl, _ = http_req(URL_CERT_LIST, "GET", H)
             certs = (cl or {}).get("certList", [])
             cert = next((c for c in certs if c.get("certName") == args.cert_name), None)

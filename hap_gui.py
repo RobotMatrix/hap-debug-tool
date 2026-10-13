@@ -987,7 +987,7 @@ class App:
                 r, _ = H.http_req(H.URL_CERT_ADD, "POST", Hh,
                                   {"certName": cert_name, "certType": 1, "csr": Path(csr).read_text()})
                 code = (r or {}).get("ret", {}).get("code")
-                if code in (0, None):
+                if code in (0, None) and r is not None:
                     cl, _ = H.http_req(H.URL_CERT_LIST, "GET", Hh)
                     certs = (cl or {}).get("certList", [])
                     cert = next((c for c in certs if c.get("certName") == cert_name), None)
@@ -1051,6 +1051,10 @@ class App:
             self.log("7) 启动")
             h.shell_out("aa", "start", "-a", ability, "-b", bundle)
             self.log(f"[+] 完成: {bundle} 已安装并启动")
+        except H.CloudAuthError as e:
+            self.log(f"[-] Token 已过期/无效: {e}")
+            self.log("    请重新登录 DevEco 获取新 Token 后重试 (浏览器登录或抓包)")
+            self.root.after(0, self._on_token_expired)
         except Exception as e:
             self.log(f"[-] 失败: {e}")
             self.log(traceback.format_exc())

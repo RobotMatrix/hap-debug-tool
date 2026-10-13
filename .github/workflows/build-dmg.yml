@@ -36,6 +36,14 @@ jobs:
           HAP_TOOLS_B64: ${{ secrets.HAP_TOOLS_B64 }}
           HAP_TOOLS_ENC_PASS: ${{ secrets.HAP_TOOLS_ENC_PASS }}
         run: |
+          flatten() {
+            # 工具包 tar 顶层是 tools/，剥掉嵌套层使 hdc/signer/store 直达 packaging/tools/
+            if [ -d packaging/tools/tools ]; then
+              cp -Rf packaging/tools/tools/ packaging/tools/
+              rm -rf packaging/tools/tools
+            fi
+            chmod +x packaging/tools/hdc packaging/tools/signer 2>/dev/null || true
+          }
           mkdir -p packaging/tools
           if [ -n "$HAP_TOOLS_URL" ] && [ -n "$HAP_TOOLS_ENC_PASS" ]; then
             echo "从 HAP_TOOLS_URL 下载加密工具包并解密..."
@@ -53,7 +61,11 @@ jobs:
           else
             echo "::warning title=缺少工具::未配置 secrets.HAP_TOOLS_URL(+ENC_PASS)/B64，dmg 不含内置 hdc/signer/key.pem"
           fi
-          ls -la packaging/tools/ 2>/dev/null || true
+          flatten
+          echo "--- packaging/tools 结构 ---"
+          ls -la packaging/tools/
+          test -f packaging/tools/signer && test -f packaging/tools/store/key.pem \
+            || { echo "::error title=工具不完整::packaging/tools 缺 signer 或 store/key.pem"; exit 1; }
 
       - name: Build dmg (未签名)
         run: |

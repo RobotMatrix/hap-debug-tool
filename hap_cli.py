@@ -1238,15 +1238,36 @@ class CloudAuthError(RuntimeError):
     """华为云请求返回 401/403 (token 过期/无效)。"""
 
 
-def http_req(url, method="GET", headers=None, body=None, _top=True):
+CLOUD_PROXY_ENV_KEYS = ("HAP_CLOUD_PROXY", "https_proxy", "HTTPS_PROXY", "all_proxy", "ALL_PROXY")
+
+
+def cloud_proxy_from_env():
+    """探测云请求代理: HAP_CLOUD_PROXY 优先, 其次 https_proxy/all_proxy 环境变量。"""
+    import os as _os
+    for k in CLOUD_PROXY_ENV_KEYS:
+        v = _os.environ.get(k, "").strip()
+        if v:
+            return v
+    return ""
+
+
+def _build_opener(proxy):
+    if not proxy:
+        return urllib.request.build_opener()
+    return urllib.request.build_opener(urllib.request.ProxyHandler({
+        "http": proxy, "https": proxy}))
+
+
+def http_req(url, method="GET", headers=None, body=None, proxy=None, timeout=60):
     import gzip as _gzip
     h = dict(headers or {})
     data = None
     if body is not None:
         data = body if isinstance(body, (bytes, bytearray)) else json.dumps(body).encode("utf-8")
     req = urllib.request.Request(url, data=data, headers=h, method=method)
+    opener = _build_opener(proxy if proxy is not None else os.environ.get("HAP_CLOUD_PROXY", ""))
     try:
-        with urllib.request.urlopen(req, timeout=60) as resp:
+        with opener.open(req, timeout=timeout) as resp:
             raw = resp.read()
             if "gzip" in (resp.headers.get("Content-Encoding") or "").lower():
                 raw = _gzip.decompress(raw)
@@ -1257,11 +1278,12 @@ def http_req(url, method="GET", headers=None, body=None, _top=True):
             raise CloudAuthError(f"HTTP {e.code} (token 过期/无效): {url}")
         return None, raw
     except Exception as e:
-        Log.err(f"请求失败: {e}")
+        Log.err(f"请求失败: {e} (url={url}, proxy={os.environ.get('HAP_CLOUD_PROXY') or '直连'})")
         return None, b""
     try:
         return json.loads(raw.decode("utf-8", "replace")), raw
     except Exception:
+        Log.err(f"响应非 JSON: {raw[:120]} ({url})")
         return None, raw
 
 

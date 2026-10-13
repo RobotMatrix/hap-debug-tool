@@ -267,6 +267,12 @@ class App:
         self.uid_var = tk.StringVar(value=uid0)
         ttk.Entry(cfg, textvariable=self.uid_var).grid(row=2, column=1, columnspan=3, sticky="we", pady=3)
 
+        ttk.Label(cfg, text="🌐  代理:").grid(row=3, column=0, sticky="e", padx=(0, 6), pady=4)
+        self.proxy_var = tk.StringVar(value=os.environ.get("HAP_CLOUD_PROXY", ""))
+        ttk.Entry(cfg, textvariable=self.proxy_var).grid(row=3, column=1, columnspan=3, sticky="we", pady=3)
+        ttk.Label(cfg, text="(云请求代理, 如 http://127.0.0.1:1087; 空=直连)").grid(
+            row=3, column=4, sticky="w", padx=(6, 0), pady=4)
+
         ioscfg = ttk.LabelFrame(left, text=" ⚙️  签名设置 (iOS) ", padding=12)
         ioscfg.columnconfigure(1, weight=1)
         self.cfg_ios = ioscfg
@@ -969,16 +975,22 @@ class App:
                 return
 
             Hh = H.hw_headers(tok, uid, team)
+            os.environ["HAP_CLOUD_PROXY"] = self.proxy_var.get().strip()
+            self.log(f"   云代理: {os.environ['HAP_CLOUD_PROXY'] or '直连'}")
             workdir = Path.home() / "Library/Caches/hap_installer/gui"
             workdir.mkdir(parents=True, exist_ok=True)
 
             self.log("1) device/list")
             dev, _ = H.http_req(H.URL_DEVICE_LIST + "?start=1&pageSize=100&encodeFlag=0", "GET", Hh)
+            if dev is None:
+                raise RuntimeError("device/list 请求失败 (网络/代理异常，详情见上方 云代理 设置与控制台日志)")
             dev_ids = [d["id"] for d in (dev or {}).get("list", [])]
             self.log(f"   设备 {len(dev_ids)} 个")
 
             self.log("2) cert/list")
             cl, _ = H.http_req(H.URL_CERT_LIST, "GET", Hh)
+            if cl is None:
+                raise RuntimeError("cert/list 请求失败 (网络/代理异常，详情见上方 云代理 设置与控制台日志)")
             certs = (cl or {}).get("certList", [])
             cert = next((c for c in certs if c.get("certName") == cert_name), None)
             if not cert:
@@ -992,6 +1004,9 @@ class App:
                     certs = (cl or {}).get("certList", [])
                     cert = next((c for c in certs if c.get("certName") == cert_name), None)
                 else:
+                    if r is None:
+                        self.log("   (cert/add 请求本身失败: 网络/代理异常或响应非 JSON，"
+                                 "检查 云代理 设置；http_req 的详细错误打印在系统控制台)")
                     self.log(f"   申请失败: {(r or {}).get('ret', {}).get('msg')}")
                     keystore = t.store_file("key.pem", required=False)
                     cert = H._pick_fallback_cert(certs, Hh, logger=self.log,

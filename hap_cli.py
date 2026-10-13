@@ -1582,7 +1582,7 @@ def cmd_cloud(args):
         print(json.dumps(j, ensure_ascii=False, indent=2))
     elif sub == "cert-add":
         guard_team(args.team_id)
-        csr_path = args.csr or Tools(args.app, args.tools).store_file("xiaobai.csr")
+        csr_path = args.csr or find_csr(Tools(args.app, args.tools))
         csr = Path(csr_path).read_text()
         j, _ = http_req(URL_CERT_ADD, "POST", H, {
             "certName": args.name, "certType": int(args.cert_type), "csr": csr})
@@ -1616,7 +1616,7 @@ def _cloud_flow(args, H):
     cert = next((c for c in certs if c.get("certName") == args.cert_name), None)
     if not cert and args.create_cert:
         guard_team(args.team_id)
-        csr_path = args.csr or Tools(args.app, args.tools).store_file("xiaobai.csr")
+        csr_path = args.csr or find_csr(Tools(args.app, args.tools))
         Log.info(f"   证书 '{args.cert_name}' 不存在, 申请中 (csr={csr_path})")
         r, _ = http_req(URL_CERT_ADD, "POST", H, {
             "certName": args.cert_name, "certType": 1, "csr": Path(csr_path).read_text()})
@@ -1647,7 +1647,7 @@ def _cloud_flow(args, H):
         download(info["newUrl"], cer_path)
 
     Log.info("4) provision/add")
-    prov_name = f"xiaobai-debug_{bundle.replace('.', '_')}"
+    prov_name = f"auto-debug_{bundle.replace('.', '_')}"
     pa, _ = http_req(URL_PROVISION_ADD, "POST", H, {
         "provisionName": prov_name,
         "aclPermissionList": [],
@@ -1937,16 +1937,16 @@ def build_parser():
     add_auth(c)
     c.add_argument("--name", required=True, help="证书名 (可含日期时间)")
     c.add_argument("--cert-type", default="1", help="1=调试 2=发布")
-    c.add_argument("--csr", help="CSR 文件 (默认内置 xiaobai.csr)")
+    c.add_argument("--csr", help="CSR 文件 (默认内置 auto.csr, 兼容 xiaobai.csr)")
     c = csub.add_parser("cert-delete", help="删除证书 (格式待定)")
     add_auth(c)
     c.add_argument("--cert-ids", nargs="+", required=True)
     c = csub.add_parser("flow", help="一键: 设备/证书/Profile 全流程 (实测格式)")
     add_auth(c)
     c.add_argument("--bundle-name", required=True)
-    c.add_argument("--cert-name", default="xiaobai-debug")
+    c.add_argument("--cert-name", default="auto-debug")
     c.add_argument("--create-cert", action="store_true", help="证书不存在时用 csr 申请")
-    c.add_argument("--csr", help="CSR 文件 (默认内置 xiaobai.csr)")
+    c.add_argument("--csr", help="CSR 文件 (默认内置 auto.csr, 兼容 xiaobai.csr)")
     c.add_argument("-o", "--out-dir", default=".")
     sp.set_defaults(func=cmd_cloud)
     return p

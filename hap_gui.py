@@ -247,10 +247,10 @@ class App:
         self.team_box.grid(row=0, column=1, sticky="we", pady=3)
 
         ttk.Label(cfg, text="🔑  证书名:").grid(row=0, column=2, sticky="e", padx=(12, 6), pady=4)
-        self.cert_name = tk.StringVar(value="xiaobai-debug-" + time.strftime("%Y%m%d%H%M%S"))
+        self.cert_name = tk.StringVar(value="auto-debug-" + time.strftime("%Y%m%d%H%M%S"))
         ttk.Entry(cfg, textvariable=self.cert_name).grid(row=0, column=3, sticky="we", pady=3)
         ttk.Button(cfg, text="🕒 重命名",
-                   command=lambda: self.cert_name.set("xiaobai-debug-" + time.strftime("%Y%m%d%H%M%S"))
+                   command=lambda: self.cert_name.set("auto-debug-" + time.strftime("%Y%m%d%H%M%S"))
                    ).grid(row=0, column=4, padx=(6, 0), pady=4)
 
         ttk.Label(cfg, text="🔐  Token:").grid(row=1, column=0, sticky="e", padx=(0, 6), pady=4)
@@ -959,7 +959,7 @@ class App:
             team = self.team_id()
             if str(team) == H.ENTERPRISE_TEAM:
                 raise RuntimeError(f"团队账户 {team} 受保护：禁止增删其证书/Profile。请选个人账户。")
-            cert_name = self.cert_name.get().strip() or ("xiaobai-debug-" + time.strftime("%Y%m%d%H%M%S"))
+            cert_name = self.cert_name.get().strip() or ("auto-debug-" + time.strftime("%Y%m%d%H%M%S"))
             self.log(f"=== 开始: {bundle} | 团队 {team}(个人) | 证书 {cert_name} ===")
 
             ok, why = H.check_token(tok, uid, team)
@@ -982,8 +982,8 @@ class App:
             certs = (cl or {}).get("certList", [])
             cert = next((c for c in certs if c.get("certName") == cert_name), None)
             if not cert:
-                self.log(f"   无 '{cert_name}'，走华为申请流程 cert/add (csr=xiaobai.csr)")
-                csr = t.store_file("xiaobai.csr")
+                csr = H.find_csr(t)
+                self.log(f"   无 '{cert_name}'，走华为申请流程 cert/add (csr={Path(csr).name})")
                 r, _ = H.http_req(H.URL_CERT_ADD, "POST", Hh,
                                   {"certName": cert_name, "certType": 1, "csr": Path(csr).read_text()})
                 code = (r or {}).get("ret", {}).get("code")
@@ -993,11 +993,14 @@ class App:
                     cert = next((c for c in certs if c.get("certName") == cert_name), None)
                 else:
                     self.log(f"   申请失败: {(r or {}).get('ret', {}).get('msg')}")
-                    cert = next((c for c in certs if c.get("certName") == "xiaobai-debug"), None)
-                    if cert:
-                        self.log("   配额已满 -> 回退复用已有证书 'xiaobai-debug'")
+                    keystore = t.store_file("key.pem", required=False)
+                    cert = H._pick_fallback_cert(certs, Hh, logger=self.log,
+                                                 keystore=keystore, tools=t)
+                    if not cert:
+                        raise RuntimeError("所有候选证书均不可用 (过期/与内置私钥不配对/下载失败)，"
+                                           "请按上方日志中的 cert-delete 命令删除过期或不配对的证书腾出配额后重试")
             if not cert:
-                raise RuntimeError("找不到可用证书 (配额已满且无 xiaobai-debug)")
+                raise RuntimeError("找不到可用证书 (配额已满且无 auto-debug/xiaobai-debug)")
             self.log(f"   用证书 {cert['certName']} id={cert['id']}")
 
             self.log("3) reapply 下载证书")
@@ -1007,7 +1010,7 @@ class App:
 
             self.log("4) provision/add 生成 Profile")
             pa, _ = H.http_req(H.URL_PROVISION_ADD, "POST", Hh, {
-                "provisionName": f"xiaobai-debug_{bundle.replace('.', '_')}",
+                "provisionName": f"auto-debug_{bundle.replace('.', '_')}",
                 "aclPermissionList": [], "deviceList": dev_ids,
                 "certList": [cert["id"]], "packageName": bundle})
             purl = (pa or {}).get("provisionFileUrl")

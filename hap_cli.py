@@ -1346,8 +1346,9 @@ def http_req_status(url, method="GET", headers=None, body=None, timeout=60):
     if body is not None:
         data = body if isinstance(body, (bytes, bytearray)) else json.dumps(body).encode("utf-8")
     req = urllib.request.Request(url, data=data, headers=h, method=method)
+    opener = _build_opener(os.environ.get("HAP_CLOUD_PROXY", "") or None)
     try:
-        with urllib.request.urlopen(req, timeout=timeout) as resp:
+        with opener.open(req, timeout=timeout) as resp:
             status = resp.status
             raw = resp.read()
             if "gzip" in (resp.headers.get("Content-Encoding") or "").lower():

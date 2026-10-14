@@ -1282,7 +1282,18 @@ class App:
             self.log("   " + (out or "").strip())
             if rc != 0 or "fail" in (out or "").lower():
                 m_perm = re.search(r"PermissionName:\s*(ohos\.permission\.\S+)", out or "")
-                if m_perm and "grant request permissions failed" in (out or ""):
+                if "9568332" in (out or "") or "sign info inconsistent" in (out or ""):
+                    self.log(f"[*] 设备已装旧签名版本 (签名信息不一致) — 自动卸载后重装")
+                    rc_u, out_u = h.uninstall(bundle)
+                    self.log("   卸载: " + (out_u or "").strip().splitlines()[0][:80])
+                    if H.is_app_pack(self.hap_path):
+                        rc, out = h.install_packages(H.app_pack_module_files(signed), replace=True)
+                    else:
+                        rc, out = h.install(str(signed), replace=True)
+                    self.log("   重装: " + (out or "").strip())
+                    if rc != 0 or "fail" in (out or "").lower():
+                        raise RuntimeError("卸载重装后仍失败")
+                elif m_perm and "grant request permissions failed" in (out or ""):
                     missing = m_perm.group(1)
                     self.log(f"[*] 检测到未授权的受限权限: {missing}")
                     if missing in acl_perms:

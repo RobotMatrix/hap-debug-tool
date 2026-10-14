@@ -70,7 +70,7 @@ def _load_app_version():
     return FALLBACK_VERSION
 
 
-FALLBACK_VERSION = "0.4.4"
+FALLBACK_VERSION = "0.5.2"
 APP_VERSION = _load_app_version()
 
 CLI_COMMANDS = {
@@ -186,6 +186,7 @@ class App:
         st.configure("Body.TLabel", font=self.f_body, foreground=C["text"], background=C["bg"])
         st.configure("Sub.TLabel", font=self.f_body, foreground=C["sub"], background=C["bg"])
         st.configure("Go.TButton", font=self.f_bold)
+        st.configure("Sub.TButton", font=self.f_sub, foreground=C["sub"])
         st.configure("TFrame", background=C["bg"])
         st.configure("TLabel", background=C["bg"])
         st.configure("TLabelframe", background=C["bg"])
@@ -272,25 +273,38 @@ class App:
                    command=lambda: self.cert_name.set("auto-debug-" + time.strftime("%Y%m%d%H%M%S"))
                    ).grid(row=0, column=4, padx=(6, 0), pady=4)
 
-        ttk.Label(cfg, text="🔐  Token:").grid(row=1, column=0, sticky="e", padx=(0, 6), pady=4)
+        adv = ttk.Frame(cfg)
+        adv.grid(row=1, column=0, columnspan=5, sticky="we", pady=(4, 0))
+        adv.columnconfigure(0, weight=1)
+        self.adv_open = tk.BooleanVar(value=False)
+        self.adv_btn = ttk.Button(adv, text="▸ 高级 (Token / 登录 / 代理)",
+                                  command=self.toggle_advanced, style="Sub.TButton")
+        self.adv_btn.grid(row=0, column=0, sticky="w")
+
+        self.adv_body = ttk.Frame(adv, padding=(2, 6, 0, 0))
+        self.adv_body.columnconfigure(1, weight=1)
+        self.adv_body.columnconfigure(3, weight=1)
+
+        ttk.Label(self.adv_body, text="🔐  Token:").grid(row=0, column=0, sticky="e", padx=(0, 6), pady=4)
         self.token_var = tk.StringVar(value=self._load_token())
-        ttk.Entry(cfg, textvariable=self.token_var, show="*").grid(row=1, column=1, columnspan=3, sticky="we", pady=3)
-        btns = ttk.Frame(cfg)
-        btns.grid(row=1, column=4, padx=(6, 0), pady=3)
+        self.token_entry = ttk.Entry(self.adv_body, textvariable=self.token_var, show="*")
+        self.token_entry.grid(row=0, column=1, columnspan=3, sticky="we", pady=3)
+        btns = ttk.Frame(self.adv_body)
+        btns.grid(row=0, column=4, padx=(6, 0), pady=3)
         ttk.Button(btns, text="🔓 登录", command=self.do_login).pack(side="left")
         ttk.Button(btns, text="🔍 检查", command=lambda: self.check_token(notify=True)).pack(side="left", padx=(4, 0))
         ttk.Button(btns, text="🔄 团队", command=self.refresh_teams).pack(side="left", padx=(4, 0))
 
-        ttk.Label(cfg, text="👤  UID:").grid(row=2, column=0, sticky="e", padx=(0, 6), pady=4)
+        ttk.Label(self.adv_body, text="👤  UID:").grid(row=1, column=0, sticky="e", padx=(0, 6), pady=4)
         uid0 = H.UID_FILE.read_text().strip() if H.UID_FILE.exists() else os.environ.get("HUAWEI_UID", "")
         self.uid_var = tk.StringVar(value=uid0)
-        ttk.Entry(cfg, textvariable=self.uid_var).grid(row=2, column=1, columnspan=3, sticky="we", pady=3)
+        ttk.Entry(self.adv_body, textvariable=self.uid_var).grid(row=1, column=1, columnspan=3, sticky="we", pady=3)
 
-        ttk.Label(cfg, text="🌐  代理:").grid(row=3, column=0, sticky="e", padx=(0, 6), pady=4)
+        ttk.Label(self.adv_body, text="🌐  代理:").grid(row=2, column=0, sticky="e", padx=(0, 6), pady=4)
         self.proxy_var = tk.StringVar(value=os.environ.get("HAP_CLOUD_PROXY", ""))
-        ttk.Entry(cfg, textvariable=self.proxy_var).grid(row=3, column=1, columnspan=3, sticky="we", pady=3)
-        ttk.Label(cfg, text="(云请求代理, 如 http://127.0.0.1:1087; 空=直连)").grid(
-            row=3, column=4, sticky="w", padx=(6, 0), pady=4)
+        ttk.Entry(self.adv_body, textvariable=self.proxy_var).grid(row=2, column=1, columnspan=3, sticky="we", pady=3)
+        ttk.Label(self.adv_body, text="(如 http://127.0.0.1:1087; 空=直连)", style="Sub.TLabel").grid(
+            row=2, column=4, sticky="w", padx=(6, 0), pady=4)
 
         ioscfg = ttk.LabelFrame(left, text=" ⚙️  签名设置 (iOS) ", padding=12)
         ioscfg.columnconfigure(1, weight=1)
@@ -321,10 +335,24 @@ class App:
         ttk.Entry(ioscfg, textvariable=self.ios_bundle_var).grid(row=2, column=1, sticky="we", pady=3)
         ttk.Label(ioscfg, text="留空 = 保持原样", style="Sub.TLabel").grid(row=2, column=2, sticky="w", padx=(6, 0))
 
+        devrow = ttk.Frame(left)
+        self.devrow = devrow
+        devrow.pack(fill="x", pady=(0, 2))
+        ttk.Label(devrow, text="📱  设备:").pack(side="left", padx=(0, 6))
+        self.device_var = tk.StringVar()
+        self.device_box = ttk.Combobox(devrow, textvariable=self.device_var,
+                                       state="readonly", width=32)
+        self.device_box.pack(side="left")
+        ttk.Button(devrow, text="🔄 刷新设备", command=self.refresh_devices).pack(side="left", padx=(6, 0))
+        self.device_lbl = ttk.Label(devrow, text="", style="Sub.TLabel")
+        self.device_lbl.pack(side="left", padx=(10, 0))
+
         act = ttk.Frame(left)
+        self.act = act
         act.pack(fill="x", pady=(2, 8))
         self.go = ttk.Button(act, text="🚀  一键安装并启动", style="Go.TButton", command=self.one_click)
         self.go.pack(side="left")
+        self.progress = ttk.Progressbar(act, mode="indeterminate", length=120)
         ttk.Button(act, text="✍️ 仅签名", command=lambda: self.one_click(install=False)).pack(side="left", padx=6)
         ttk.Button(act, text="📲 仅安装", command=self.install_only).pack(side="left", padx=6)
         ttk.Button(act, text="🗑️ 清空日志", command=self.clear_log).pack(side="right")
@@ -342,21 +370,82 @@ class App:
         logf.pack(fill="both", expand=True, pady=(8, 0))
         self.logbox = tk.Text(logf, height=10, bg=self.box_bg, fg=self.box_fg,
                               insertbackground=self.box_fg, font=self.f_mono,
-                              highlightthickness=1, highlightbackground=C["drop_bd"])
+                              highlightthickness=1, highlightbackground=C["drop_bd"],
+                              wrap="word", state="disabled", cursor="arrow")
         sb = ttk.Scrollbar(logf, command=self.logbox.yview)
         self.logbox.config(yscrollcommand=sb.set)
         sb.pack(side="right", fill="y")
         self.logbox.pack(fill="both", expand=True)
+        for tag, color in (("+", C["success"]), ("-", "#FF453A" if dark else "#FF3B30"),
+                           ("!", "#FFD60A" if dark else "#B25000"), ("*", C["accent"])):
+            self.logbox.tag_configure(tag, foreground=color)
+        self.logbox.tag_configure("dim", foreground=C["sub"])
+        self.log_autoscroll = tk.BooleanVar(value=True)
+        logbar = ttk.Frame(logf)
+        logbar.pack(fill="x", side="bottom")
+        ttk.Checkbutton(logbar, text="自动滚动", variable=self.log_autoscroll).pack(side="right")
+        self.log_ts = tk.BooleanVar(value=False)
+        ttk.Checkbutton(logbar, text="时间戳", variable=self.log_ts,
+                        command=self._rebuild_log_ts).pack(side="right", padx=(0, 10))
+        self._raw_log = []
+        self.logbox.bind("<Button-3>", self._log_context_menu)
+        self.logbox.bind("<Button-2>", self._log_context_menu)
 
         self.root.after(100, self._drain)
         self.root.after(800, self.check_token)
         self.root.after(300, self.refresh_ios_profiles)
+        self.root.after(200, self.refresh_devices)
 
     def log(self, msg):
         self.logq.put(str(msg))
 
     def clear_log(self):
+        self._raw_log.clear()
+        self.logbox.config(state="normal")
         self.logbox.delete("1.0", "end")
+        self.logbox.config(state="disabled")
+
+    def _log_tag_for(self, msg):
+        s = msg.lstrip()
+        for prefix, tag in (("[+]", "+"), ("[-]", "-"), ("[!]", "!"), ("[*]", "*")):
+            if s.startswith(prefix):
+                return tag
+        if s.startswith("=== ") or s.startswith("Traceback"):
+            return "!"
+        return None
+
+    def _append_log(self, msg):
+        self._raw_log.append(msg)
+        self.logbox.config(state="normal")
+        if self.log_ts.get():
+            ts = time.strftime("%H:%M:%S ")
+            self.logbox.insert("end", ts, "dim")
+        tag = self._log_tag_for(msg)
+        self.logbox.insert("end", msg + "\n", tag or ())
+        self.logbox.config(state="disabled")
+
+    def _rebuild_log_ts(self):
+        self.logbox.config(state="normal")
+        self.logbox.delete("1.0", "end")
+        for msg in self._raw_log:
+            if self.log_ts.get():
+                self.logbox.insert("end", time.strftime("%H:%M:%S "), "dim")
+            self.logbox.insert("end", msg + "\n", self._log_tag_for(msg) or ())
+        self.logbox.config(state="disabled")
+        self.logbox.see("end")
+
+    def _log_context_menu(self, event):
+        m = tk.Menu(self.root, tearoff=0)
+        m.add_command(label="复制", command=self._log_copy)
+        m.add_command(label="全选", command=lambda: self.logbox.tag_add("sel", "1.0", "end"))
+        m.tk_popup(event.x_root, event.y_root)
+
+    def _log_copy(self):
+        text = self.logbox.get("sel.first", "sel.last") or self.logbox.get("1.0", "end").strip()
+        if text:
+            self.root.clipboard_clear()
+            self.root.clipboard_append(text)
+            self.log("[*] 日志已复制到剪贴板")
 
     def _set_out(self, path):
         self.out_var.set(path or "—")
@@ -375,12 +464,15 @@ class App:
             subprocess.run(["open", "-R", p])
 
     def _drain(self):
+        dirty = False
         try:
             while True:
-                self.logbox.insert("end", self.logq.get_nowait() + "\n")
-                self.logbox.see("end")
+                self._append_log(self.logq.get_nowait())
+                dirty = True
         except queue.Empty:
             pass
+        if dirty and self.log_autoscroll.get():
+            self.logbox.see("end")
         if self.detail_visible and self.detail_win is not None:
             try:
                 want_x = self.root.winfo_rootx() + self.root.winfo_width() + 8
@@ -460,6 +552,45 @@ class App:
         if self.detail_visible and self.detail_win is not None:
             self._render_detail()
 
+    def toggle_advanced(self):
+        open_ = not self.adv_open.get()
+        self.adv_open.set(open_)
+        self.adv_btn.config(text="▾ 高级 (Token / 登录 / 代理)" if open_
+                            else "▸ 高级 (Token / 登录 / 代理)")
+        if open_:
+            self.adv_body.grid(row=2, column=0, columnspan=5, sticky="we", pady=(4, 0))
+        else:
+            self.adv_body.grid_forget()
+
+    def _device_key(self):
+        v = (self.device_var.get() or "").strip()
+        return v or None
+
+    def refresh_devices(self):
+        def work():
+            try:
+                t = H.Tools()
+                h = H.Hdc(t, self._device_key())
+                targets = h.targets()
+            except SystemExit as e:
+                self.root.after(0, lambda: self.device_lbl.config(text=f"找不到 hdc ({e})"))
+                return
+            except Exception as e:
+                self.root.after(0, lambda: self.device_lbl.config(text=f"刷新失败: {e}"))
+                return
+            def done():
+                if targets:
+                    self.device_box.config(values=targets)
+                    if not self.device_var.get() or self.device_var.get() not in targets:
+                        self.device_var.set(targets[0])
+                    self.device_lbl.config(text=f"{len(targets)} 台")
+                else:
+                    self.device_box.config(values=[])
+                    self.device_var.set("")
+                    self.device_lbl.config(text="未连接 (检查 USB 调试/网络调试)")
+            self.root.after(0, done)
+        threading.Thread(target=work, daemon=True).start()
+
     def on_platform_change(self):
         ios = self.platform.get() == "ios"
         self.title_lbl.config(text="📱  iOS 调试助手" if ios else "📦  HAP 调试助手")
@@ -469,12 +600,14 @@ class App:
                          else "⬇️   把 .app / .hap 拖到这里   (或点此选择文件)")
         if ios:
             self.cfg_harmony.pack_forget()
+            self.devrow.pack_forget()
             self.cfg_ios.pack(fill="x", pady=8)
             self.refresh_ios_identities()
             self.refresh_ios_profiles()
         else:
             self.cfg_ios.pack_forget()
             self.cfg_harmony.pack(fill="x", pady=8)
+            self.devrow.pack(fill="x", pady=(0, 2), before=self.act)
         self.info.config(text="未选择文件")
         self.hap_path = None
         self.meta = None
@@ -739,10 +872,18 @@ class App:
         try:
             self.meta = H.read_hap_meta(path)
             m = self.meta["modules"][0] if self.meta["modules"] else {}
-            self.info.config(text=f"{self._ellipsize(os.path.basename(path), 38)}  "
-                                  f"bundle: {m.get('bundleName')}  "
-                                  f"版本: {m.get('versionName')}")
-            self.log(f"[+] 已选择 {path}\n    bundle={m.get('bundleName')}")
+            size_mb = self.meta.get("size", 0) / 1024 / 1024
+            signed = "已签名" if self.meta.get("signed") else "未签名"
+            dot = C["success"] if self.meta.get("signed") else C["sub"]
+            self.info.config(
+                text=f"{self._ellipsize(os.path.basename(path), 34)}   "
+                     f"{m.get('bundleName')}  v{m.get('versionName')}  "
+                     f"{size_mb:.1f} MB",
+                foreground=C["text"])
+            self.sig_hint.config(text=signed)
+            self.sig_dot.config(foreground=dot)
+            self.log(f"[+] 已选择 {path}\n    bundle={m.get('bundleName')} "
+                     f"v{m.get('versionName')} ({size_mb:.1f} MB, {signed})")
         except Exception as e:
             self.info.config(text=f"解析失败: {e}")
             self.log(f"[-] 解析失败: {e}")
@@ -888,6 +1029,18 @@ class App:
             self.root.after(0, fill)
         threading.Thread(target=work, daemon=True).start()
 
+    def _set_busy(self, busy):
+        self.busy = busy
+        self.go.config(state="disabled" if busy else "normal")
+        if busy:
+            self.go.config(text="⏳  处理中…")
+            self.progress.pack(fill="x", before=self.go, pady=(0, 2))
+            self.progress.start(12)
+        else:
+            self.go.config(text="🚀  一键安装并启动")
+            self.progress.stop()
+            self.progress.pack_forget()
+
     def one_click(self, install=True):
         if self.busy:
             return
@@ -901,15 +1054,13 @@ class App:
             if not self.ios_identity_var.get().strip():
                 messagebox.showwarning("提示", "请先刷新并选择签名证书")
                 return
-            self.busy = True
-            self.go.config(state="disabled")
+            self._set_busy(True)
             threading.Thread(target=self._pipeline_ios, args=(install,), daemon=True).start()
             return
         if not self.token_var.get().strip():
             messagebox.showwarning("提示", "请填写 oauth2token (或点登录)")
             return
-        self.busy = True
-        self.go.config(state="disabled")
+        self._set_busy(True)
         threading.Thread(target=self._pipeline, args=(install,), daemon=True).start()
 
     def _pipeline_ios(self, install=True):
@@ -971,8 +1122,7 @@ class App:
             self.log(f"[-] 失败: {e}")
             self.log(traceback.format_exc())
         finally:
-            self.busy = False
-            self.root.after(0, lambda: self.go.config(state="normal"))
+            self.root.after(0, lambda: self._set_busy(False))
 
     def _pipeline(self, install):
         try:
@@ -1061,7 +1211,7 @@ class App:
 
             self.log("5) 本地签名")
             key = t.store_file("key.pem")
-            h = H.Hdc(t)
+            h = H.Hdc(t, self._device_key())
             if H.is_app_pack(self.hap_path):
                 signed = H.sign_app_pack(t, self.hap_path, str(workdir), key, "", "xiaobai",
                                          str(cer), str(p7b))
@@ -1099,8 +1249,7 @@ class App:
             self.log(f"[-] 失败: {e}")
             self.log(traceback.format_exc())
         finally:
-            self.busy = False
-            self.root.after(0, lambda: self.go.config(state="normal"))
+            self.root.after(0, lambda: self._set_busy(False))
 
     def install_only(self):
         if not self.hap_path:
@@ -1109,8 +1258,7 @@ class App:
         if self.busy:
             return
         if self.platform.get() == "ios":
-            self.busy = True
-            self.go.config(state="disabled")
+            self._set_busy(True)
             def ios_work():
                 try:
                     self.log(f"安装 {self.hap_path} ...")
@@ -1120,16 +1268,14 @@ class App:
                 except Exception as e:
                     self.log(f"[-] {e}")
                 finally:
-                    self.busy = False
-                    self.root.after(0, lambda: self.go.config(state="normal"))
+                    self.root.after(0, lambda: self._set_busy(False))
             threading.Thread(target=ios_work, daemon=True).start()
             return
-        self.busy = True
-        self.go.config(state="disabled")
+        self._set_busy(True)
         def work():
             try:
                 t = H.Tools()
-                h = H.Hdc(t)
+                h = H.Hdc(t, self._device_key())
                 bundle = (self.meta or {}).get("modules", [{}])[0].get("bundleName")
                 ability = (self.meta or {}).get("modules", [{}])[0].get("mainElement") or "EntryAbility"
                 if H.is_app_pack(self.hap_path):
@@ -1152,8 +1298,7 @@ class App:
             except Exception as e:
                 self.log(f"[-] {e}")
             finally:
-                self.busy = False
-                self.root.after(0, lambda: self.go.config(state="normal"))
+                self.root.after(0, lambda: self._set_busy(False))
         threading.Thread(target=work, daemon=True).start()
 
 

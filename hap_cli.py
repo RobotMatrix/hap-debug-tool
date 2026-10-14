@@ -1513,8 +1513,9 @@ def check_cert_usable(cert_id, cert_object_id, headers, download_fn=None):
         return False, f"reapply 未返回下载地址: {rp}", b""
     import gzip as _gzip
     req = urllib.request.Request(url, headers={"user-agent": "Dart/3.6 (dart:io)"})
+    opener = _build_opener(os.environ.get("HAP_CLOUD_PROXY", "") or None)
     try:
-        with urllib.request.urlopen(req, timeout=60) as resp:
+        with opener.open(req, timeout=60) as resp:
             raw = resp.read()
             if "gzip" in (resp.headers.get("Content-Encoding") or "").lower():
                 raw = _gzip.decompress(raw)

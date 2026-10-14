@@ -1647,6 +1647,48 @@ def verify_key_cert_pair(cert_pem, keystore, tools=None):
 
 DEFAULT_CSR_FILES = ("auto.csr", "xiaobai.csr")
 
+# 华为受限开放权限 (ACL) 常用清单 — debug profile 需在 allowed-acls 声明,
+# 否则设备端安装报 9568289 grant request permissions failed。
+# 非穷举: 设备报错未收录的权限由 _pipeline 报错驱动自动补充。
+KNOWN_ACL_PERMISSIONS = {
+    "ohos.permission.DLP_GET_HIDE_STATUS",
+    "ohos.permission.DLP_SET_HIDE_STATUS",
+    "ohos.permission.READ_WRITE_DOWNLOAD_DIRECTORY",
+    "ohos.permission.READ_WRITE_DOCUMENTS_DIRECTORY",
+    "ohos.permission.READ_WRITE_DESKTOP_DIRECTORY",
+    "ohos.permission.READ_WRITE_MEDIA_LIBRARY",
+    "ohos.permission.MANAGE_DISPOSED_APP",
+    "ohos.permission.GET_BUNDLE_INFO_PRIVILEGED",
+    "ohos.permission.KEEP_BACKGROUND_RUNNING",
+    "ohos.permission.START_INVISIBLE_ABILITY",
+    "ohos.permission.AGENT_MESSAGES",
+}
+
+
+def get_hap_acl_permissions(hap_path):
+    """提取 HAP 申请的受限 ACL 权限 (与 KNOWN_ACL_PERMISSIONS 交集)。"""
+    p = Path(hap_path)
+    names = []
+    try:
+        if p.is_dir():
+            mjs = [f for f in p.rglob("module.json")]
+        elif zipfile.is_zipfile(p):
+            with zipfile.ZipFile(p) as z:
+                mjs = [json.loads(z.read(n).decode("utf-8", "replace"))
+                       for n in z.namelist() if n.endswith("module.json")]
+        else:
+            mjs = []
+        for mj in mjs:
+            if isinstance(mj, Path):
+                mj = json.loads(mj.read_text(encoding="utf-8"))
+            for perm in mj.get("module", {}).get("requestPermissions", []):
+                name = perm.get("name")
+                if name in KNOWN_ACL_PERMISSIONS:
+                    names.append(name)
+    except Exception:
+        return []
+    return sorted(set(names))
+
 
 def find_csr(t):
     """按顺序查找内置 CSR: auto.csr -> xiaobai.csr (向后兼容旧安装)。"""

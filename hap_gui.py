@@ -1240,9 +1240,13 @@ class App:
             H.download(((rp or {}).get("urlsInfo") or [{}])[0].get("newUrl"), str(cer))
 
             self.log("4) provision/add 生成 Profile")
+            acl_perms = H.get_hap_acl_permissions(self.hap_path)
+            if acl_perms:
+                self.log(f"   检测到受限 ACL 权限 {len(acl_perms)} 项, 将声明进 Profile: "
+                         + ", ".join(p.split('.')[-1] for p in acl_perms))
             pa, _ = H.http_req(H.URL_PROVISION_ADD, "POST", Hh, {
                 "provisionName": f"auto-debug_{bundle.replace('.', '_')}",
-                "aclPermissionList": [], "deviceList": dev_ids,
+                "aclPermissionList": acl_perms, "deviceList": dev_ids,
                 "certList": [cert["id"]], "packageName": bundle})
             purl = (pa or {}).get("provisionFileUrl")
             if not purl:
@@ -1277,7 +1281,37 @@ class App:
 
             self.log("   " + (out or "").strip())
             if rc != 0 or "fail" in (out or "").lower():
-                raise RuntimeError("安装失败")
+                m_perm = re.search(r"PermissionName:\s*(ohos\.permission\.\S+)", out or "")
+                if m_perm and "grant request permissions failed" in (out or ""):
+                    missing = m_perm.group(1)
+                    self.log(f"[*] 检测到未授权的受限权限: {missing}")
+                    if missing in acl_perms:
+                        raise RuntimeError(
+                            f"权限 {missing} 已声明进 Profile 仍被拒 — 请在 AGC 手工确认该权限可申请")
+                    self.log("[*] 自动重发 Profile (补充 ACL) 并重签重装 ...")
+                    acl_perms = sorted(set(acl_perms) | {missing})
+                    pa, _ = H.http_req(H.URL_PROVISION_ADD, "POST", Hh, {
+                        "provisionName": f"auto-debug_{bundle.replace('.', '_')}",
+                        "aclPermissionList": acl_perms, "deviceList": dev_ids,
+                        "certList": [cert["id"]], "packageName": bundle})
+                    purl = (pa or {}).get("provisionFileUrl")
+                    if not purl:
+                        raise RuntimeError(f"provision/add 失败: {pa}")
+                    H.download(purl, str(p7b))
+                    if H.is_app_pack(self.hap_path):
+                        signed = H.sign_app_pack(t, self.hap_path, str(workdir), key, "", "xiaobai",
+                                                 str(cer), str(p7b))
+                        mods = H.app_pack_module_files(signed)
+                        rc, out = h.install_packages(mods, replace=True)
+                    else:
+                        src = H.resolve_hap(self.hap_path)
+                        H.do_sign(t, src, str(signed), key, "", "xiaobai", str(cer), str(p7b))
+                        rc, out = h.install(str(signed), replace=True)
+                    self.log("   重试安装: " + (out or "").strip())
+                    if rc != 0 or "fail" in (out or "").lower():
+                        raise RuntimeError(f"重试后仍失败 (ACL 已补 {missing})")
+                else:
+                    raise RuntimeError("安装失败")
 
             self.log("7) 启动")
             h.shell_out("aa", "start", "-a", ability, "-b", bundle)

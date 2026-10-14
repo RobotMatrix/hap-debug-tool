@@ -1278,11 +1278,12 @@ def _find_ca_bundle():
 
 
 _CA_BUNDLE = None
+_CA_SSL_HANDLER = None
 _CA_CHECKED = False
 
 
 def _build_opener(proxy):
-    global _CA_BUNDLE, _CA_CHECKED
+    global _CA_BUNDLE, _CA_SSL_HANDLER, _CA_CHECKED
     handlers = []
     if proxy:
         handlers.append(urllib.request.ProxyHandler({"http": proxy, "https": proxy}))
@@ -1292,8 +1293,10 @@ def _build_opener(proxy):
         if _CA_BUNDLE:
             import ssl
             ctx = ssl.create_default_context(cafile=_CA_BUNDLE)
-            handlers.append(urllib.request.HTTPSHandler(context=ctx))
+            _CA_SSL_HANDLER = urllib.request.HTTPSHandler(context=ctx)
             Log.info(f"SSL CA: {_CA_BUNDLE}")
+    if _CA_SSL_HANDLER is not None:
+        handlers.append(_CA_SSL_HANDLER)
     return urllib.request.build_opener(*handlers)
 
 

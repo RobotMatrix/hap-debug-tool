@@ -874,12 +874,12 @@ class App:
             m = self.meta["modules"][0] if self.meta["modules"] else {}
             size_mb = self.meta.get("size", 0) / 1024 / 1024
             signed = "已签名" if self.meta.get("signed") else "未签名"
-            dot = C["success"] if self.meta.get("signed") else C["sub"]
+            dot = self.C["success"] if self.meta.get("signed") else self.C["sub"]
             self.info.config(
                 text=f"{self._ellipsize(os.path.basename(path), 34)}   "
                      f"{m.get('bundleName')}  v{m.get('versionName')}  "
                      f"{size_mb:.1f} MB",
-                foreground=C["text"])
+                foreground=self.C["text"])
             self.sig_hint.config(text=signed)
             self.sig_dot.config(foreground=dot)
             self.log(f"[+] 已选择 {path}\n    bundle={m.get('bundleName')} "

@@ -949,6 +949,28 @@ class App:
         vals = list(self.ios_prov_box.cget("values"))
         if vals and self.ios_prov_box.current() == 0:
             self.use_embedded_provision()
+        else:
+            self._auto_match_provision(bundle)
+
+    def _auto_match_provision(self, bundle):
+        """按 bundle-id + 当前身份自动匹配描述文件 (仅建议, 不强制切换)。"""
+        ident = self.ios_identity_var.get().strip()
+        if not bundle or not ident or not IOS:
+            return
+        def work():
+            try:
+                path, detail = IOS.auto_select_provision(bundle, ident)
+            except Exception as e:
+                self.root.after(0, lambda: self.log(f"[-] profile 自动匹配失败: {e}"))
+                return
+            def done():
+                if path:
+                    self.log(f"[*] 建议 profile: {detail}\n    {path}\n"
+                             f"    (下拉选择即生效; 安装包自带优先, 手选不受影响)")
+                else:
+                    self.log(f"[!] {detail}")
+            self.root.after(0, done)
+        threading.Thread(target=work, daemon=True).start()
 
     def _load_token(self):
         if H.TOKEN_FILE.exists():

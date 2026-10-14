@@ -395,6 +395,128 @@ def read_bundle_id(app_dir):
         return plistlib.load(f).get("CFBundleIdentifier", "")
 
 
+# ---------------------------------------------------------------- auto provision match
+
+def _read_bundle_id_of(src):
+    """读 .ipa / .app / 含 .app 目录的 bundle-id (不落盘)。"""
+    src = Path(src)
+    if src.suffix == ".app":
+        return read_bundle_id(src)
+    if src.suffix == ".ipa":
+        with zipfile.ZipFile(src) as z:
+            for n in z.namelist():
+                if n.endswith(".app/Info.plist") and n.count("/") == 2:
+                    return plistlib.load(z.open(n)).get("CFBundleIdentifier", "")
+        raise FileNotFoundError(f"{src} 内未找到 Info.plist")
+    if src.is_dir():
+        apps = list(src.rglob("*.app"))
+        if apps:
+            return read_bundle_id(apps[0])
+    raise FileNotFoundError(f"{src} 中找不到 .app")
+
+def _profile_cert_sha1s(profile_dict):
+    """提取 profile 内嵌证书的 SHA-1 指纹集合 (大写, 无冒号)。"""
+    out = set()
+    for der in profile_dict.get("DeveloperCertificates") or []:
+        try:
+            fd, tmp = tempfile.mkstemp(prefix="pc_", suffix=".cer")
+            with os.fdopen(fd, "wb") as f:
+                f.write(bytes(der))
+            _, out, _ = _run(["openssl", "x509", "-inform", "DER", "-in", tmp,
+                              "-noout", "-fingerprint", "-sha1"])
+            os.unlink(tmp)
+            m = re.search(r"=([0-9A-F:]{40})", out)
+            if m:
+                out.add(m.group(1).replace(":", "").upper())
+        except Exception:
+            continue
+    return out
+
+
+def _identity_sha1(identity_name):
+    """按身份名取钥匙串证书 SHA-1 指纹 (大写无冒号)。失败返回 None。"""
+    try:
+        _, out, _ = _run(["security", "find-certificate", "-c", identity_name,
+                          "-Z", "login.keychain"])
+        m = re.search(r'SHA-1 hash:\s*([0-9A-F]{40})', out, re.I)
+        return m.group(1).upper() if m else None
+    except Exception:
+        return None
+
+
+def _wildcard_rank(pattern_appid, bundle_id):
+    """application-identifier 的 bundle 部分对 bundle_id 的匹配度。
+
+    返回 (matched, rank): rank 越大越精确。不匹配 (False, 0)。
+    """
+    if not pattern_appid:
+        return False, 0
+    pat = pattern_appid.split(".", 1)[1] if "." in pattern_appid else pattern_appid
+    if pat == "*":
+        return True, 1
+    if pat == bundle_id:
+        return True, 100
+    if pat.endswith(".*"):
+        prefix = pat[:-2]
+        if bundle_id.startswith(prefix + "."):
+            return True, max(2, 50 - (len(pattern_appid) - len(bundle_id)))
+    return False, 0
+
+
+def auto_select_provision(bundle_id, identity_name=None, profiles=None,
+                          require_devices=False):
+    """按 bundle-id 与签名身份自动匹配最佳描述文件。
+
+    返回 (path|None, detail_str)。匹配规则:
+      硬性: 未过期 / bundle-id 匹配 (精确或通配) / 非 macOS 专属
+      打分: 精确 bundle-id > 短通配 > 长*; 内含选中证书 +30; 开发身份配
+            GetTaskAllow profile +10; 到期晚者在前。
+    """
+    if profiles is None:
+        profiles = list_profiles()
+    ident_sha1 = _identity_sha1(identity_name) if identity_name else None
+    is_dev_cert = "Apple Development" in (identity_name or "")
+    candidates = []
+    rejects = []
+    for pr in profiles:
+        try:
+            full = read_mobileprovision(pr["path"])
+        except Exception as e:
+            rejects.append(f"{pr['name']}: 解析失败 ({e})")
+            continue
+        appid = pr.get("appid", "")
+        matched, rank = _wildcard_rank(appid, bundle_id or "")
+        if not matched:
+            rejects.append(f"{pr['name']}: bundle-id 不匹配 ({appid or '空'})")
+            continue
+        score = rank
+        why = []
+        cert_shas = _profile_cert_sha1s(full)
+        if ident_sha1 and ident_sha1 in cert_shas:
+            score += 30
+            why.append("含选中证书")
+        if is_dev_cert and full.get("GetTaskAllow"):
+            score += 10
+            why.append("开发类型匹配")
+        exp = pr.get("expiration")
+        if hasattr(exp, "timestamp"):
+            score += min(20, max(0, (exp.timestamp() - time.time()) / 86400))
+        devs = full.get("ProvisionedDevices") or []
+        if require_devices and not devs and not full.get("ProvisionsAllDevices"):
+            rejects.append(f"{pr['name']}: 无授权设备")
+            continue
+        candidates.append((score, pr["path"], pr["name"], why))
+    if not candidates:
+        detail = "无匹配 profile。逐个排除原因:\n  " + "\n  ".join(rejects[:10])
+        return None, detail
+    candidates.sort(key=lambda c: -c[0])
+    score, path, name, why = candidates[0]
+    detail = f"自动匹配: {name} (score={score:.0f}" + (", " + ", ".join(why) if why else "") + ")"
+    if ident_sha1 and "含选中证书" not in why:
+        detail += "。注意: 该 profile 不含所选证书, 安装设备可能报 profile 无效 — "                  "请在 Xcode/开发者网站用当前证书重新生成 profile"
+    return path, detail
+
+
 def set_bundle_id(app_dir, bundle_id):
     """改 Info.plist 的 CFBundleIdentifier"""
     info = Path(app_dir) / "Info.plist"
@@ -715,10 +837,17 @@ def main():
             overrides[k] = v == "true" if v in ("true", "false") else v
         src = Path(args.path)
         out = Path(args.out) if args.out else Path.cwd() / f"{src.stem}-signed.ipa"
+        provision = args.provision
+        if not provision:
+            bid = args.bundle_id or _read_bundle_id_of(src)
+            provision, detail = auto_select_provision(bid, args.identity)
+            print(f"[*] {detail}")
+            if not provision:
+                raise SystemExit("[-] 自动匹配 profile 失败, 请用 -p 手动指定")
         if src.suffix == ".ipa":
-            got = sign_ipa(src, out, args.identity, args.provision, overrides, args.bundle_id)
+            got = sign_ipa(src, out, args.identity, provision, overrides, args.bundle_id)
         else:
-            got = sign_app_source(src, out.parent, args.identity, args.provision, overrides, args.bundle_id)
+            got = sign_app_source(src, out.parent, args.identity, provision, overrides, args.bundle_id)
         print(f"[+] 已签名: {got}")
         ok, detail = verify(got)
         print(("[+] 校验通过" if ok else "[-] 校验失败") + "\n" + detail)

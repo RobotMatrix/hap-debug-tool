@@ -652,7 +652,7 @@ class App:
         return specials
 
     def refresh_ios_profiles(self):
-        if not IOS:
+        if not IOS or self.platform.get() != "ios":
             return
         def work():
             try:
@@ -692,9 +692,11 @@ class App:
 
     def use_embedded_provision(self):
         """提取安装包内嵌描述文件并应用"""
+        if self.platform.get() != "ios":
+            return
         src = self.hap_path
         if not src:
-            self.log("[-] 请先拖入 ipa 再使用「安装包自带」")
+            self.log("[-] 请先拖入 .ipa 安装包再使用「安装包自带」")
             self.ios_prov_var.set("")
             return
         p = Path(src)

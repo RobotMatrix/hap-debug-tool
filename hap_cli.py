@@ -487,8 +487,16 @@ def resolve_hap(path):
 
 
 def app_pack_module_files(app_path):
-    """返回 App Pack 内的模块文件列表 (hap 在前, hsp 在后)。"""
+    """返回 App Pack 内的模块文件列表 (hap 在前, hsp 在后)。
+
+    zip 形式的 .app 会先解包到临时目录再返回真实文件路径 (hdc 无法直接装 zip 内模块)。
+    """
     p = Path(app_path)
+    if not p.is_dir() and zipfile.is_zipfile(p):
+        out_dir = Path(tempfile.mkdtemp(prefix="happack_zip_")) / p.stem
+        with zipfile.ZipFile(p) as z:
+            z.extractall(out_dir)
+        p = out_dir
     mods = [str(f) for f in p.rglob("*") if f.is_file() and f.suffix in (".hap", ".hsp")]
     mods.sort(key=lambda x: (0 if x.endswith(".hap") else 1, x))
     return mods

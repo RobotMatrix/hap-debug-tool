@@ -54,7 +54,24 @@ DEFAULT_TEAMS = [
     ("企业 · 北京梆梆安全科技有限公司 (只读,禁止增删)", "30086000687991714"),
 ]
 
-APP_VERSION = "0.4.4"
+def _load_app_version():
+    """版本号: 打包时注入的 version.txt 优先, 回退源码常量 (开发态)。"""
+    try:
+        base = getattr(sys, "_MEIPASS", None)
+        if base:
+            vf = Path(base) / "version.txt"
+            if vf.exists():
+                return vf.read_text().strip() or FALLBACK_VERSION
+        vf = Path(__file__).resolve().parent / "version.txt"
+        if vf.exists():
+            return vf.read_text().strip() or FALLBACK_VERSION
+    except Exception:
+        pass
+    return FALLBACK_VERSION
+
+
+FALLBACK_VERSION = "0.4.4"
+APP_VERSION = _load_app_version()
 
 CLI_COMMANDS = {
     "info", "sig", "sign", "verify", "genkeys", "signprofile",

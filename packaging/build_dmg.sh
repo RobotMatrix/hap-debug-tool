@@ -27,6 +27,14 @@ fi
 echo ">> [2/4] 安装 PyInstaller"
 "$PY" -m pip install -q pyinstaller certifi 2>&1 | tail -1
 
+# 版本号注入: APP_VERSION env (workflow 传 tag) > git describe > 回退
+if [ -z "${APP_VERSION:-}" ]; then
+  APP_VERSION="$(git -C "$ROOT" describe --tags --match 'v[0-9]*' 2>/dev/null | sed 's/^v//' | cut -d- -f1 || true)"
+fi
+APP_VERSION="${APP_VERSION:-dev}"
+echo "$APP_VERSION" > "$HERE/version.txt"
+echo ">> 版本号: $APP_VERSION"
+
 echo ">> [3/4] PyInstaller 构建 .app"
 cd "$HERE"
 "$PY" "$HERE/make_icon.py" >/dev/null 2>&1 || echo "   (图标生成跳过)"
@@ -38,6 +46,7 @@ rm -rf dist "HAP调试助手.spec"
   --osx-bundle-identifier com.xiaobai.hapinstaller \
   --add-data "$TOOLS:tools" \
   --add-data "$HERE/assets:assets" \
+  --add-data "$HERE/version.txt:." \
   --collect-all tkinterdnd2 \
   --collect-all certifi \
   $ICON_ARG \

@@ -68,6 +68,8 @@ jobs:
             || { echo "::error title=工具不完整::packaging/tools 缺 signer 或 store/key.pem"; exit 1; }
 
       - name: Build dmg (未签名)
+        env:
+          APP_VERSION: ${{ github.ref_name }}
         run: |
           chmod +x packaging/*.sh
           PY=python3 ./packaging/build_dmg.sh

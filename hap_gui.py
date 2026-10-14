@@ -1002,14 +1002,20 @@ class App:
             self.log("1) device/list")
             dev, _ = H.http_req(H.URL_DEVICE_LIST + "?start=1&pageSize=100&encodeFlag=0", "GET", Hh)
             if dev is None:
-                raise RuntimeError("device/list 请求失败 (网络/代理异常，详情见上方 云代理 设置与控制台日志)")
+                hint = H.LAST_NET_ERROR or "未知错误"
+                raise RuntimeError(
+                    f"device/list 请求失败 [{hint}]。直连异常时可尝试在「云代理」填 "
+                    f"http://127.0.0.1:1087 (本机 privoxy) 后重试")
             dev_ids = [d["id"] for d in (dev or {}).get("list", [])]
             self.log(f"   设备 {len(dev_ids)} 个")
 
             self.log("2) cert/list")
             cl, _ = H.http_req(H.URL_CERT_LIST, "GET", Hh)
             if cl is None:
-                raise RuntimeError("cert/list 请求失败 (网络/代理异常，详情见上方 云代理 设置与控制台日志)")
+                hint = H.LAST_NET_ERROR or "未知错误"
+                raise RuntimeError(
+                    f"cert/list 请求失败 [{hint}]。直连异常时可尝试在「云代理」填 "
+                    f"http://127.0.0.1:1087 (本机 privoxy) 后重试")
             certs = (cl or {}).get("certList", [])
             cert = next((c for c in certs if c.get("certName") == cert_name), None)
             if not cert:

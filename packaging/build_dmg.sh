@@ -31,6 +31,7 @@ echo ">> [2/4] 安装 PyInstaller"
 if [ -z "${APP_VERSION:-}" ]; then
   APP_VERSION="$(git -C "$ROOT" describe --tags --match 'v[0-9]*' 2>/dev/null | sed 's/^v//' | cut -d- -f1 || true)"
 fi
+APP_VERSION="${APP_VERSION#v}"
 APP_VERSION="${APP_VERSION:-dev}"
 echo "$APP_VERSION" > "$HERE/version.txt"
 echo ">> 版本号: $APP_VERSION"

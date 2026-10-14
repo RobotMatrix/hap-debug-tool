@@ -1297,7 +1297,11 @@ def _build_opener(proxy):
     return urllib.request.build_opener(*handlers)
 
 
+LAST_NET_ERROR = ""
+
+
 def http_req(url, method="GET", headers=None, body=None, proxy=None, timeout=60):
+    global LAST_NET_ERROR
     import gzip as _gzip
     h = dict(headers or {})
     data = None
@@ -1315,14 +1319,16 @@ def http_req(url, method="GET", headers=None, body=None, proxy=None, timeout=60)
         Log.err(f"HTTP {e.code} {url}")
         if e.code in (401, 403):
             raise CloudAuthError(f"HTTP {e.code} (token 过期/无效): {url}")
+        LAST_NET_ERROR = f"HTTP {e.code}"
         return None, raw
     except Exception as e:
+        LAST_NET_ERROR = f"{type(e).__name__}: {e}"
         Log.err(f"请求失败: {e} (url={url}, proxy={os.environ.get('HAP_CLOUD_PROXY') or '直连'})")
         return None, b""
     try:
+        LAST_NET_ERROR = ""
         return json.loads(raw.decode("utf-8", "replace")), raw
     except Exception:
-        Log.err(f"响应非 JSON: {raw[:120]} ({url})")
         return None, raw
 
 

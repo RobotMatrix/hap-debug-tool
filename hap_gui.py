@@ -571,25 +571,42 @@ class App:
             try:
                 t = H.Tools()
                 h = H.Hdc(t, self._device_key())
-                targets = h.targets()
+                keys = h.targets()
+                labels = {k: h.device_label(k) for k in keys}
             except SystemExit as e:
-                self.root.after(0, lambda: self.device_lbl.config(text=f"找不到 hdc ({e})"))
+                self.root.after(0, lambda: (self.device_lbl.config(text=f"找不到 hdc ({e})"),
+                                            self.log(f"[-] 设备刷新失败: 找不到 hdc ({e})")))
                 return
             except Exception as e:
-                self.root.after(0, lambda: self.device_lbl.config(text=f"刷新失败: {e}"))
+                self.root.after(0, lambda: (self.device_lbl.config(text=f"刷新失败: {e}"),
+                                            self.log(f"[-] 设备刷新失败: {e}")))
                 return
             def done():
-                if targets:
-                    self.device_box.config(values=targets)
-                    if not self.device_var.get() or self.device_var.get() not in targets:
-                        self.device_var.set(targets[0])
-                    self.device_lbl.config(text=f"{len(targets)} 台")
+                self._device_keys = keys
+                self._device_labels = labels
+                if keys:
+                    disp = [labels[k] for k in keys]
+                    self.device_box.config(values=disp)
+                    if not self.device_var.get() or self.device_var.get() not in disp:
+                        self.device_var.set(disp[0])
+                    self.device_lbl.config(text=f"{len(keys)} 台")
                 else:
                     self.device_box.config(values=[])
                     self.device_var.set("")
                     self.device_lbl.config(text="未连接 (检查 USB 调试/网络调试)")
             self.root.after(0, done)
         threading.Thread(target=work, daemon=True).start()
+
+    def _device_key(self):
+        v = (self.device_var.get() or "").strip()
+        labels = getattr(self, "_device_labels", {})
+        if v in labels:
+            return v
+        for k, lbl in labels.items():
+            if lbl == v:
+                return k
+        keys = getattr(self, "_device_keys", [])
+        return keys[0] if keys else None
 
     def on_platform_change(self):
         ios = self.platform.get() == "ios"

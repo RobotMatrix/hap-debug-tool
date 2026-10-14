@@ -918,6 +918,36 @@ class Hdc:
         _, out = self.raw(["list", "targets"], capture=True)
         return [l.strip() for l in out.splitlines() if l.strip() and "Empty" not in l]
 
+    def device_label(self, key, timeout=3.0):
+        """设备显示标签: {型号}[{key}]{OS 版本}({API 版本})。取不到字段时回退裸 key。"""
+        def get(param):
+            try:
+                _, out = self.raw(["-t", key, "shell", "param", "get", param],
+                                  check=False, capture=True)
+                v = (out or "").strip()
+                if v and "fail" not in v.lower() and "error" not in v.lower():
+                    return v
+            except Exception:
+                pass
+            return ""
+        name = get("const.product.name")
+        sw = get("const.product.software.version")
+        api = get("const.ohos.apiversion")
+        os_ver = ""
+        if sw:
+            m = re.search(r"(\d+\.\d+\.\d+)", sw)
+            os_ver = m.group(1) if m else sw.split()[0] if sw.split() else ""
+        parts = []
+        if name:
+            parts.append(name)
+        parts.append(f"[{key}]")
+        if os_ver:
+            parts.append(os_ver)
+            if api:
+                parts.append(f"({api})")
+        label = "".join(parts) if name or os_ver else key
+        return label
+
     def tconn(self, addr):
         return self.raw(["tconn", addr], check=False, capture=True)
 

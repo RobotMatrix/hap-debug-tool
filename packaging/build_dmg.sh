@@ -25,7 +25,7 @@ else
 fi
 
 echo ">> [2/4] 安装 PyInstaller"
-"$PY" -m pip install -q pyinstaller 2>&1 | tail -1
+"$PY" -m pip install -q pyinstaller certifi 2>&1 | tail -1
 
 echo ">> [3/4] PyInstaller 构建 .app"
 cd "$HERE"
@@ -39,6 +39,7 @@ rm -rf dist "HAP调试助手.spec"
   --add-data "$TOOLS:tools" \
   --add-data "$HERE/assets:assets" \
   --collect-all tkinterdnd2 \
+  --collect-all certifi \
   $ICON_ARG \
   --paths "$ROOT" \
   "$ROOT/hap_gui.py" 2>&1 | tail -5

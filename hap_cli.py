@@ -1251,11 +1251,50 @@ def cloud_proxy_from_env():
     return ""
 
 
+def _find_ca_bundle():
+    """定位可用 CA bundle: certifi 优先, 其次系统 CA (macOS/Linux 常见路径)。
+
+    PyInstaller 冻结的 Python (actions/setup-python 构建) 其 OpenSSL 默认 CA
+    路径指向构建机失效目录, HTTPS 验证报 unable to get local issuer certificate。
+    """
+    cands = []
+    try:
+        import certifi
+        cands.append(certifi.where())
+    except Exception:
+        pass
+    cands += [
+        "/etc/ssl/cert.pem",                      # macOS 系统 CA
+        "/etc/ssl/certs/ca-certificates.crt",     # Debian/Ubuntu
+        "/etc/pki/tls/certs/ca-bundle.crt",       # RHEL
+    ]
+    for p in cands:
+        try:
+            if p and os.path.exists(p) and os.path.getsize(p) > 10000:
+                return p
+        except OSError:
+            continue
+    return None
+
+
+_CA_BUNDLE = None
+_CA_CHECKED = False
+
+
 def _build_opener(proxy):
-    if not proxy:
-        return urllib.request.build_opener()
-    return urllib.request.build_opener(urllib.request.ProxyHandler({
-        "http": proxy, "https": proxy}))
+    global _CA_BUNDLE, _CA_CHECKED
+    handlers = []
+    if proxy:
+        handlers.append(urllib.request.ProxyHandler({"http": proxy, "https": proxy}))
+    if not _CA_CHECKED:
+        _CA_CHECKED = True
+        _CA_BUNDLE = _find_ca_bundle()
+        if _CA_BUNDLE:
+            import ssl
+            ctx = ssl.create_default_context(cafile=_CA_BUNDLE)
+            handlers.append(urllib.request.HTTPSHandler(context=ctx))
+            Log.info(f"SSL CA: {_CA_BUNDLE}")
+    return urllib.request.build_opener(*handlers)
 
 
 def http_req(url, method="GET", headers=None, body=None, proxy=None, timeout=60):

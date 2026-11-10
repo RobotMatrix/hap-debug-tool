@@ -2,6 +2,19 @@
 
 所有显著变更记录在本文件。格式参考 Keep a Changelog。
 
+## [Unreleased] - 2026-11-10 (5)
+
+### Added - GUI iOS 签名支持「最低系统版本」+ Tk 线程安全修复
+
+- GUI iOS 设置面板新增「📉 最低系统版本」输入框 (默认 13.0), `_pipeline_ios`
+  透传 `min_os` 到 `sign_ipa/sign_app_source`; 留空不降
+- **线程安全修复**: `_pipeline_ios` 工作线程直接读 Tk 变量/调 `root.after` 在
+  Tk 8.5 (Xcode Python) 下崩 `main thread is not in main loop`。改为
+  `one_click` 主线程快照全部变量传参 + 新增 `App._ui()`: 工作线程 UI 操作经
+  logq 队列投递主线程执行 (`_drain` 消费 `__UI__` 标记项)
+- 端到端验证: GUI 管线装 minOS 15 加固包到 iOS 13.6 iPhone X 成功
+  (降级 → 重签 → 校验 → 自动回退 ios-deploy)
+
 ## [Unreleased] - 2026-11-10 (4)
 
 ### Added - `install` 自动回退 ios-deploy (iOS<17 老设备)

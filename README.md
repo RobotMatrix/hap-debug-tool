@@ -40,6 +40,9 @@ profile、重签名、校验）与 .ipa/.app 一致。
 unavailable 但 usbmuxd 可见）自动回退 `ios-deploy`（需 `brew install ios-deploy`）。
 两通道 UDID 异构（40 位 hex vs `00008xxx-xxx`），GUI/CLI 无需手动区分。
 
+GUI iOS 设置面板有「📉 最低系统版本」输入框（默认 13.0），与 CLI `--min-os`
+等价；老设备装高版本标高的包时无需降级脚本。
+
 ### 描述文件三种来源（GUI 描述文件下拉框）
 
 1. **📦 安装包自带**（默认第一项）——自动提取 ipa 内 `embedded.mobileprovision`，缓存于

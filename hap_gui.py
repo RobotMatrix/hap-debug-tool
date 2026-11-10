@@ -344,6 +344,12 @@ class App:
         ttk.Entry(ioscfg, textvariable=self.ios_bundle_var).grid(row=2, column=1, sticky="we", pady=3)
         ttk.Label(ioscfg, text="留空 = 保持原样", style="Sub.TLabel").grid(row=2, column=2, sticky="w", padx=(6, 0))
 
+        ttk.Label(ioscfg, text="📉  最低系统:").grid(row=3, column=0, sticky="e", padx=(0, 6), pady=4)
+        self.ios_min_os_var = tk.StringVar(value="13.0")
+        ttk.Entry(ioscfg, textvariable=self.ios_min_os_var, width=8).grid(row=3, column=1, sticky="w", pady=3)
+        ttk.Label(ioscfg, text="降包的 MinimumOSVersion (老设备装高版本标高的包); 留空 = 不降",
+                  style="Sub.TLabel").grid(row=3, column=2, sticky="w", padx=(6, 0))
+
         devrow = ttk.Frame(left)
         self.devrow = devrow
         devrow.pack(fill="x", pady=(0, 2))
@@ -409,6 +415,19 @@ class App:
 
     def log(self, msg):
         self.logq.put(str(msg))
+
+    def _ui(self, fn, *args):
+        """工作线程调用 UI 操作的统一入口: 主线程直接执行, 工作线程经 logq 队列
+        投递到主线程 (_drain 已在消费)。Tk 8.5 下工作线程直接 root.after 会
+        'main thread is not in main loop'。"""
+        import threading as _th
+        if _th.current_thread() is _th.main_thread():
+            try:
+                fn(*args)
+            except Exception:
+                pass
+            return
+        self.logq.put(("__UI__", fn, args))
 
     def clear_log(self):
         self._raw_log.clear()
@@ -478,7 +497,16 @@ class App:
         dirty = False
         try:
             while True:
-                self._append_log(self.logq.get_nowait())
+                item = self.logq.get_nowait()
+                if isinstance(item, tuple) and item and item[0] == "__UI__":
+                    _, fn, args = item
+                    try:
+                        fn(*args)
+                    except Exception:
+                        pass
+                    dirty = True
+                    continue
+                self._append_log(item)
                 dirty = True
         except queue.Empty:
             pass
@@ -1145,8 +1173,15 @@ class App:
             if not self.ios_identity_var.get().strip():
                 messagebox.showwarning("提示", "请先刷新并选择签名证书")
                 return
+            snap = {
+                "identity": self.ios_identity_var.get().strip(),
+                "prov": self.ios_prov_path,
+                "bundle": self.ios_bundle_var.get().strip() or None,
+                "min_os": self.ios_min_os_var.get().strip() or None,
+                "path": self.hap_path,
+            }
             self._set_busy(True)
-            threading.Thread(target=self._pipeline_ios, args=(install,), daemon=True).start()
+            threading.Thread(target=self._pipeline_ios, args=(install, snap), daemon=True).start()
             return
         if not self.token_var.get().strip():
             messagebox.showwarning("提示", "请填写 oauth2token (或点登录)")
@@ -1154,14 +1189,24 @@ class App:
         self._set_busy(True)
         threading.Thread(target=self._pipeline, args=(install,), daemon=True).start()
 
-    def _pipeline_ios(self, install=True):
+    def _pipeline_ios(self, install=True, snapshot=None):
         try:
-            src = Path(self.hap_path)
-            identity = self.ios_identity_var.get().strip()
-            prov = self.ios_prov_path or None
-            bundle_override = self.ios_bundle_var.get().strip() or None
+            if snapshot is None:
+                # Tk 变量读操作必须在主线程; 线程入口先快照 (one_click 已在主线程取过则直接用)
+                snapshot = {
+                    "identity": self.ios_identity_var.get().strip(),
+                    "prov": self.ios_prov_path,
+                    "bundle": self.ios_bundle_var.get().strip() or None,
+                    "min_os": self.ios_min_os_var.get().strip() or None,
+                    "path": self.hap_path,
+                }
+            src = Path(snapshot["path"])
+            identity = snapshot["identity"]
+            prov = snapshot["prov"] or None
+            bundle_override = snapshot["bundle"]
+            min_os = snapshot["min_os"]
             self.log(f"=== iOS 开始: {src.name} | 证书 {identity[:60]} | "
-                     f"描述文件 {'有' if prov else '无'} ===")
+                     f"描述文件 {'有' if prov else '无'} | min-os {min_os or '不降'} ===")
 
             # profile 兼容性预检: 固定 bundle id 的 profile 与设备上已装的同名应用
             # (通配 entitlement) 会冲突, 报 MismatchedApplicationIdentifierEntitlement
@@ -1190,11 +1235,11 @@ class App:
             if src.suffix == ".ipa":
                 out = workdir / f"{src.stem}-signed.ipa"
                 IOS.sign_ipa(src, out, identity, prov,
-                             bundle_id=bundle_override)
+                             bundle_id=bundle_override, min_os=min_os)
             else:
                 out = IOS.sign_app_source(src, workdir, identity, prov,
-                                          bundle_id=bundle_override)
-            self.root.after(0, lambda p=str(out): self._set_out(p))
+                                          bundle_id=bundle_override, min_os=min_os)
+            self._ui(self._set_out, str(out))
             self.log(f"   产物: {out}")
 
             self.log("2) 校验")
@@ -1216,7 +1261,7 @@ class App:
             self.log(f"[-] 失败: {e}")
             self.log(traceback.format_exc())
         finally:
-            self.root.after(0, lambda: self._set_busy(False))
+            self._ui(self._set_busy, False)
 
     def _pipeline(self, install):
         try:

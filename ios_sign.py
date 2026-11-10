@@ -709,7 +709,7 @@ def format_sign_info(info):
 # ---------------------------------------------------------------- devices / install
 
 def list_devices():
-    """列出 iOS 设备 (devicectl, 兜底 cfgutil). 返回 [(id, 名称, 状态)], 含模拟器和不可用设备"""
+    """列出 iOS 设备 (devicectl, 兜底 cfgutil). 返回 [(id, 名称, 状态, 物理设备?)]"""
     rc, out, err = _run(["xcrun", "devicectl", "list", "devices"], timeout=60)
     if rc == 0:
         devs = []
@@ -734,6 +734,20 @@ def list_devices():
                 devs.append((parts[0], parts[1].strip(), "Connected", True))
         return devs
     raise RuntimeError(f"设备枚举失败: devicectl/cfgutil 均不可用\n{err.strip()}")
+
+
+def get_first_physical_udid():
+    """返回第一台可用物理设备 UDID, 无则 None (投屏/日志窗口用)。"""
+    try:
+        for d in list_devices():
+            if not d[3]:
+                continue
+            state = d[2].lower()
+            if state.startswith("available") or state == "connected":
+                return d[0]
+    except Exception:
+        pass
+    return None
 
 
 def _unsigned_nested_bundles(ipa_path):

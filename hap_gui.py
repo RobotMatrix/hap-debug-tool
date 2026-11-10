@@ -16,6 +16,7 @@ import os
 import plistlib
 import queue
 import re
+import shutil
 import sys
 import tempfile
 import threading
@@ -42,6 +43,12 @@ try:
 except Exception as e:
     print("无法导入 ios_sign.py:", e)
     IOS = None
+
+try:
+    import device_tools as DT
+except Exception as e:
+    print("无法导入 device_tools.py:", e)
+    DT = None
 
 try:
     from tkinterdnd2 import TkinterDnD, DND_FILES
@@ -150,6 +157,8 @@ class App:
         self.ios_local_prov = None
         self.ios_embedded_prov = None
         self.ios_prov_path = None
+        self.mirror_win = None
+        self.log_wins = {}
 
         dark = is_dark_mode()
         C = {
@@ -355,6 +364,8 @@ class App:
         self.progress = ttk.Progressbar(act, mode="indeterminate", length=120)
         ttk.Button(act, text="✍️ 仅签名", command=lambda: self.one_click(install=False)).pack(side="left", padx=6)
         ttk.Button(act, text="📲 仅安装", command=self.install_only).pack(side="left", padx=6)
+        ttk.Button(act, text="🖥️ 投屏", command=self.open_mirror).pack(side="left", padx=6)
+        ttk.Button(act, text="📜 设备日志", command=self.open_device_log).pack(side="left", padx=6)
         ttk.Button(act, text="🗑️ 清空日志", command=self.clear_log).pack(side="right")
 
         outrow = ttk.Frame(left)
@@ -607,6 +618,43 @@ class App:
                 return k
         keys = getattr(self, "_device_keys", [])
         return keys[0] if keys else None
+
+    def _device_tool_key(self):
+        """设备工具窗口用的设备标识: 鸿蒙=connect key, iOS=UDID。"""
+        if self.platform.get() == "ios":
+            udid = IOS.get_first_physical_udid() if IOS else None
+            if not udid:
+                messagebox.showwarning("提示", "没有已连接的 iOS 设备 (devicectl 未发现可用物理设备)")
+                return None
+            return udid
+        return self._device_key()
+
+    def open_mirror(self):
+        if not DT:
+            messagebox.showwarning("提示", "device_tools.py 不可用")
+            return
+        key = self._device_tool_key()
+        if not key:
+            return
+        if self.mirror_win is not None and self.mirror_win.winfo_exists():
+            self.mirror_win.win.lift()
+            return
+        self.mirror_win = MirrorWindow(self, self.platform.get(), key)
+        self.log(f"[*] 投屏窗口已打开 ({self.platform.get()} · {key})")
+
+    def open_device_log(self):
+        if not DT:
+            messagebox.showwarning("提示", "device_tools.py 不可用")
+            return
+        key = self._device_tool_key()
+        if not key:
+            return
+        win = self.log_wins.get(self.platform.get())
+        if win is not None and win.winfo_exists():
+            win.win.lift()
+            return
+        self.log_wins[self.platform.get()] = DeviceLogWindow(self, self.platform.get(), key)
+        self.log(f"[*] 设备日志窗口已打开 ({self.platform.get()} · {key})")
 
     def on_platform_change(self):
         ios = self.platform.get() == "ios"
@@ -1391,6 +1439,495 @@ class App:
             finally:
                 self.root.after(0, lambda: self._set_busy(False))
         threading.Thread(target=work, daemon=True).start()
+
+
+class MirrorWindow:
+    """设备投屏窗口: 截屏轮询。鸿蒙支持点击/滑动/按键回传; iOS 系统无输入注入, 只读。"""
+
+    POLL_MS = {"harmony": 500, "ios": 1000}
+
+    def __init__(self, app, platform, device_key):
+        self.app = app
+        self.platform = platform          # harmony | ios
+        self.device_key = device_key
+        self.capture = None
+        self.input = None
+        self._running = False
+        self._photo = None
+        self._fps_cnt = 0
+        self._fps_t0 = time.time()
+        self._frame_q = queue.Queue()
+        self._shot_png = Path(tempfile.mkdtemp(prefix="hapdbg_gui_mirror_")) / "frame.png"
+
+        w = tk.Toplevel(app.root)
+        w.title(f"📱 设备投屏 · {device_key}")
+        w.geometry("420x760")
+        w.configure(bg=app.C["bg"])
+        w.protocol("WM_DELETE_WINDOW", self.close)
+        self.win = w
+
+        bar = ttk.Frame(w)
+        bar.pack(fill="x", padx=8, pady=(8, 4))
+        self.lbl_status = ttk.Label(bar, text="● 连接中", foreground=app.C["sub"])
+        self.lbl_status.pack(side="left")
+        self.lbl_fps = ttk.Label(bar, text="—", style="Sub.TLabel")
+        self.lbl_fps.pack(side="left", padx=(10, 0))
+        ttk.Button(bar, text="⌨️ Home", command=lambda: self.send_key("home")).pack(side="right")
+        ttk.Button(bar, text="⬅️ 返回", command=lambda: self.send_key("back")).pack(side="right", padx=(0, 4))
+
+        self.canvas = tk.Label(w, bg="#000", anchor="center")
+        self.canvas.pack(fill="both", expand=True, padx=8, pady=4)
+        self.canvas.bind("<Button-1>", self._on_click)
+        self.canvas.bind("<Double-Button-1>", self._on_double)
+        self.canvas.bind("<ButtonPress-1>", self._on_press_xy)
+        self.canvas.bind("<ButtonRelease-1>", self._on_release_swipe)
+        self.bind_scroll()
+
+        foot = ttk.Frame(w)
+        foot.pack(fill="x", padx=8, pady=(0, 8))
+        ttk.Button(foot, text="📸 截图保存", command=self.save_screenshot).pack(side="left")
+        ttk.Label(foot, text="(iOS 系统无输入注入, 只读投屏)" if platform == "ios"
+                  else "点击画面 = 触摸设备, 拖拽 = 滑动",
+                  style="Sub.TLabel").pack(side="left", padx=8)
+
+        self.start_capture()
+        self._poll()
+
+    def bind_scroll(self):
+        pass
+
+    def start_capture(self):
+        try:
+            if self.platform == "harmony":
+                hdc_bin = H.Tools().tool("hdc")
+                self.capture = DT.HarmonyScreen(hdc_bin, self.device_key)
+                wh = self._probe_harmony_wh()
+                self.input = DT.HarmonyInput(hdc_bin, self.device_key, screen_wh=wh)
+            else:
+                self.capture = DT.IOSScreen(self.device_key)
+        except Exception as e:
+            self.app.log(f"[-] 投屏初始化失败: {e}")
+            self.lbl_status.config(text="● 初始化失败", foreground=self.app.C["error"])
+            return
+        self._running = True
+        self.lbl_status.config(text="● 投屏中", foreground=self.app.C["success"])
+
+    def _probe_harmony_wh(self):
+        rc, out, _ = DT._run([H.Tools().tool("hdc")] + (["-t", self.device_key] if self.device_key else [])
+                             + ["shell", "snapshot_display", "-f", DT.SHOT_REMOTE], timeout=15)
+        m = re.search(r"width\s+(\d+),\s*height\s+(\d+)", out or "")
+        if m:
+            return (int(m.group(1)), int(m.group(2)))
+        return (1216, 2688)
+
+    def _poll(self):
+        if not self._running:
+            return
+        def work():
+            ok, ms, err = self.capture.grab(self._shot_png)
+            self._frame_q.put((ok, ms, err))
+        threading.Thread(target=work, daemon=True).start()
+        self.win.after(self.POLL_MS.get(self.platform, 800), self._drain_frame)
+
+    def _drain_frame(self):
+        if not self._running:
+            return
+        try:
+            ok, ms, err = self._frame_q.get_nowait()
+        except queue.Empty:
+            self.win.after(60, self._drain_frame)
+            return
+        self._frame_done(ok, ms, err)
+
+    def _frame_done(self, ok, ms, err):
+        if not self._running:
+            return
+        if ok:
+            try:
+                disp = self._make_display_frame()
+                img = tk.PhotoImage(file=str(disp))
+                self._photo = img
+                self.canvas.config(image=img, text="")
+                self._img_wh = self._src_wh or (img.width(), img.height())
+                self._fps_cnt += 1
+                now = time.time()
+                if now - self._fps_t0 >= 2.0:
+                    fps = self._fps_cnt / (now - self._fps_t0)
+                    self.lbl_fps.config(text=f"{fps:.1f} fps · {ms}ms")
+                    self._fps_cnt = 0
+                    self._fps_t0 = now
+                self.lbl_status.config(text="● 投屏中", foreground=self.app.C["success"])
+            except Exception as e:
+                self.canvas.config(text=f"渲染失败: {e}")
+        else:
+            self.lbl_status.config(text="● 抓帧失败", foreground=self.app.C["error"])
+            if err:
+                self.app.log(f"[!] 投屏抓帧失败: {err}")
+        if self._running:
+            self.win.after(80, self._poll)
+
+    def _make_display_frame(self):
+        """显示帧: sips 转磁盘临时文件。Tk 8.5 的 PhotoImage 只认 GIF/PGM/PPM
+        (PNG 需 Tk 8.6+), 统一转 GIF 双版本兼容; 同时按画布重采样防高分屏撑爆窗口。"""
+        cw = max(self.canvas.winfo_width(), 200)
+        ch = max(self.canvas.winfo_height(), 300)
+        src = str(self._shot_png)
+        try:
+            out = subprocess.run(["sips", "-g", "pixelWidth", "-g", "pixelHeight", src],
+                                 capture_output=True, text=True, timeout=10).stdout
+            w = int(re.search(r"pixelWidth:\s*(\d+)", out).group(1))
+            h = int(re.search(r"pixelHeight:\s*(\d+)", out).group(1))
+            self._src_wh = (w, h)
+        except Exception:
+            self._src_wh = None
+        disp = self._shot_png.parent / "disp.gif"
+        args = ["sips", "-s", "format", "gif"]
+        if self._src_wh:
+            scale = min(cw / w, ch / h, 1.0)
+            if scale < 0.98:
+                args += ["-z", str(max(1, int(h * scale))), str(max(1, int(w * scale)))]
+        args += [src, "--out", str(disp)]
+        subprocess.run(args, capture_output=True, timeout=10)
+        return disp if disp.exists() else src
+
+    def _canvas_ratio(self, event):
+        wh = getattr(self, "_img_wh", None)
+        if not wh:
+            return None, None
+        cw = max(self.canvas.winfo_width(), 1)
+        ch = max(self.canvas.winfo_height(), 1)
+        scale = min(cw / wh[0], ch / wh[1])
+        draw_w, draw_h = wh[0] * scale, wh[1] * scale
+        ox, oy = (cw - draw_w) / 2, (ch - draw_h) / 2
+        x = (event.x - ox) / max(draw_w, 1)
+        y = (event.y - oy) / max(draw_h, 1)
+        if 0 <= x <= 1 and 0 <= y <= 1:
+            return x, y
+        return None, None
+
+    def _on_press_xy(self, event):
+        self._press_pt = self._canvas_ratio(event)
+
+    def _on_release_swipe(self, event):
+        if self.platform != "harmony" or not self.input:
+            return
+        p0 = getattr(self, "_press_pt", (None, None))
+        p1 = self._canvas_ratio(event)
+        if p0[0] is None or p1[0] is None:
+            return
+        dx, dy = abs(p1[0] - p0[0]), abs(p1[1] - p0[1])
+        if dx < 0.02 and dy < 0.02:
+            return
+        threading.Thread(target=lambda: self.input.swipe(*p0, *p1), daemon=True).start()
+
+    def _on_click(self, event):
+        if self.platform != "harmony" or not self.input:
+            return
+        x, y = self._canvas_ratio(event)
+        if x is None:
+            return
+        threading.Thread(target=lambda: self.input.click(x, y), daemon=True).start()
+
+    def _on_double(self, event):
+        if self.platform != "harmony" or not self.input:
+            return
+        x, y = self._canvas_ratio(event)
+        if x is None:
+            return
+        threading.Thread(target=lambda: self.input.double_click(x, y), daemon=True).start()
+
+    def send_key(self, name):
+        if self.platform != "harmony" or not self.input:
+            if self.platform == "ios":
+                self.app.log("[!] iOS 投屏只读, 无法发送按键 (系统无输入注入)")
+            return
+        threading.Thread(target=lambda: self.input.key(name), daemon=True).start()
+
+    def save_screenshot(self):
+        src = self._shot_png
+        if not src.exists():
+            self.app.log("[-] 尚无截图帧")
+            return
+        dest = filedialog.asksaveasfilename(
+            defaultextension=".png", initialfile=f"screen-{time.strftime('%Y%m%d-%H%M%S')}.png",
+            filetypes=[("PNG", "*.png")])
+        if dest:
+            import shutil as _sh
+            _sh.copy2(src, dest)
+            self.app.log(f"[+] 截图已保存: {dest}")
+
+    def close(self):
+        self._running = False
+        if self.capture:
+            try:
+                self.capture.cleanup()
+            except Exception:
+                pass
+        shutil.rmtree(self._shot_png.parent, ignore_errors=True)
+        self.win.destroy()
+        self.app.mirror_win = None
+
+
+class DeviceLogWindow:
+    """设备日志窗口: 运行日志流 (hilog/syslog) + 崩溃日志列表/拉取。"""
+
+    MAX_LINES = 8000
+
+    def __init__(self, app, platform, device_key):
+        self.app = app
+        self.platform = platform
+        self.device_key = device_key
+        self.proc = None
+        self._q = queue.Queue()
+        self._after_id = None
+
+        w = tk.Toplevel(app.root)
+        w.title(f"📜 设备日志 · {device_key}")
+        w.geometry("980x620")
+        w.configure(bg=app.C["bg"])
+        w.protocol("WM_DELETE_WINDOW", self.close)
+        self.win = w
+
+        bar = ttk.Frame(w)
+        bar.pack(fill="x", padx=8, pady=(8, 4))
+        ttk.Label(bar, text="过滤:", style="Sub.TLabel").pack(side="left")
+        self.filter_var = tk.StringVar()
+        e = ttk.Entry(bar, textvariable=self.filter_var, width=24)
+        e.pack(side="left", padx=(4, 8))
+        e.bind("<KeyRelease>", lambda ev: self._apply_filter())
+        self.level_var = tk.StringVar(value="全部")
+        cb = ttk.Combobox(bar, textvariable=self.level_var, width=6, state="readonly",
+                          values=["全部", "ERROR", "FATAL"] if platform == "harmony" else ["全部"])
+        cb.pack(side="left")
+        cb.bind("<<ComboboxSelected>>", lambda ev: self._restart_stream())
+        self.btn_stream = ttk.Button(bar, text="⏸ 暂停", command=self.toggle_stream)
+        self.btn_stream.pack(side="left", padx=(8, 0))
+        ttk.Button(bar, text="💾 保存日志", command=self.save_log).pack(side="right")
+        ttk.Button(bar, text="🧹 清空", command=self._clear).pack(side="right", padx=4)
+
+        self.txt = tk.Text(w, wrap="none", font=app.f_mono,
+                           bg=app.C["box_bg"], fg=app.C["box_fg"],
+                           insertbackground=app.C["box_fg"],
+                           state="disabled", highlightthickness=1,
+                           highlightbackground=app.C["drop_bd"])
+        ys = ttk.Scrollbar(w, command=self.txt.yview, orient="vertical")
+        xs = ttk.Scrollbar(w, command=self.txt.xview, orient="horizontal")
+        self.txt.config(yscrollcommand=ys.set, xscrollcommand=xs.set)
+        ys.pack(side="right", fill="y")
+        xs.pack(side="bottom", fill="x")
+        self.txt.pack(fill="both", expand=True, padx=(8, 0), pady=(0, 4))
+        for tag, color in (("+", app.C["success"]), ("-", "#FF453A"), ("!", "#FFD60A"),
+                           ("*", app.C["accent"])):
+            self.txt.tag_configure(tag, foreground=color)
+        self.txt.tag_configure("err", foreground="#FF453A")
+        self.txt.tag_configure("dim", foreground=app.C["sub"])
+
+        crashf = ttk.LabelFrame(w, text=" 💥 崩溃日志 ", padding=4)
+        crashf.pack(fill="x", padx=8, pady=(0, 8))
+        self.crash_list = ttk.Combobox(crashf, state="readonly")
+        self.crash_list.pack(side="left", fill="x", expand=True, padx=(0, 6))
+        ttk.Button(crashf, text="🔄 刷新", command=self.refresh_crashes).pack(side="left")
+        ttk.Button(crashf, text="⬇️ 拉取选中", command=self.pull_crash).pack(side="left", padx=4)
+        ttk.Button(crashf, text="⬇️ 全部拉取", command=self.pull_all_crashes).pack(side="left", padx=(0, 4))
+        ttk.Button(crashf, text="📂 打开目录", command=self.open_crash_dir).pack(side="left")
+        self.crash_dir = Path.home() / "Downloads" / "hapdbg-crashes" / device_key.replace(":", "_")
+
+        self._start_stream()
+        self._drain()
+        self.refresh_crashes()
+
+    # ---- 运行日志流 ----
+    def _log_cmd(self):
+        if self.platform == "harmony":
+            hdc_bin = H.Tools().tool("hdc")
+            logs = DT.HarmonyLogs(hdc_bin, self.device_key)
+            level = {"ERROR": "ERROR", "FATAL": "FATAL"}.get(self.level_var.get())
+            return logs.hilog_args(level=level, app_only=True)
+        return DT.IOSLogs(self.device_key).syslog_cmd()
+
+    def _start_stream(self):
+        try:
+            cmd = self._log_cmd()
+        except Exception as e:
+            self.app.log(f"[-] 日志流启动失败: {e}")
+            return
+        try:
+            self.proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                                         text=True, bufsize=1)
+        except Exception as e:
+            self._put(f"[-] 无法启动日志命令: {e}\n", "err")
+            return
+        self.btn_stream.config(text="⏸ 暂停")
+        threading.Thread(target=self._pump, daemon=True).start()
+
+    def _pump(self):
+        try:
+            for line in self.proc.stdout:
+                self._q.put(line)
+        except Exception:
+            pass
+
+    def _drain(self):
+        n = 0
+        stopped = False
+        while n < 400:
+            try:
+                line = self._q.get_nowait()
+            except queue.Empty:
+                break
+            self._put(line)
+            n += 1
+        if self.proc is not None and self.proc.poll() is not None:
+            stopped = True
+        if self.win.winfo_exists():
+            self._after_id = self.win.after(120, self._drain)
+            if stopped and self._streaming_wanted():
+                self._put("[*] 日志进程退出, 重启流\n", "dim")
+                self._start_stream()
+
+    def _streaming_wanted(self):
+        return getattr(self, "_want_stream", True)
+
+    def toggle_stream(self):
+        if self.proc is not None and self.proc.poll() is None:
+            self._want_stream = False
+            self.proc.terminate()
+            self.btn_stream.config(text="▶ 继续")
+            self._put("[*] 已暂停\n", "dim")
+        else:
+            self._want_stream = True
+            self._start_stream()
+
+    def _restart_stream(self):
+        if self.proc is not None and self.proc.poll() is None:
+            self.proc.terminate()
+            time.sleep(0.2)
+        if self._streaming_wanted():
+            self._start_stream()
+
+    def _put(self, line, tag=None):
+        if self.filter_var.get().strip() and self.filter_var.get().strip().lower() not in line.lower():
+            return
+        t = tag or ("err" if re.search(r"\b(F|FATAL|ERROR|Error|panic|crash)\b", line) else None)
+        self.txt.config(state="normal")
+        self.txt.insert("end", line, t or ())
+        lines = int(self.txt.index("end-1c").split(".")[0])
+        if lines > self.MAX_LINES:
+            self.txt.delete("1.0", f"{lines - self.MAX_LINES}.0")
+        self.txt.config(state="disabled")
+        self.txt.see("end")
+
+    def _apply_filter(self):
+        pass
+
+    def _clear(self):
+        self.txt.config(state="normal")
+        self.txt.delete("1.0", "end")
+        self.txt.config(state="disabled")
+
+    def save_log(self):
+        dest = filedialog.asksaveasfilename(
+            defaultextension=".log", initialfile=f"{self.platform}-log-{time.strftime('%Y%m%d-%H%M%S')}.log",
+            filetypes=[("日志", "*.log *.txt")])
+        if not dest:
+            return
+        with open(dest, "w") as f:
+            f.write(self.txt.get("1.0", "end"))
+        self.app.log(f"[+] 日志已保存: {dest}")
+
+    # ---- 崩溃日志 ----
+    def _crash_helper(self):
+        if self.platform == "harmony":
+            return DT.HarmonyLogs(H.Tools().tool("hdc"), self.device_key)
+        return DT.IOSLogs(self.device_key)
+
+    def refresh_crashes(self):
+        def work():
+            try:
+                if self.platform == "harmony":
+                    return self._crash_helper().crash_list(), ""
+                return [], ""
+            except Exception as e:
+                return [], str(e)
+        threading.Thread(target=lambda: self._crash_done(*work()), daemon=True).start()
+
+    def _crash_done(self, names, err):
+        if not self.win.winfo_exists():
+            return
+        if err:
+            self.app.log(f"[-] 崩溃列表获取失败: {err}")
+            return
+        if self.platform == "ios":
+            self.crash_list.config(values=[], state="disabled")
+            self._put("[*] iOS 崩溃日志请在下方「全部拉取」后于本地目录查看 (.ips)\n", "dim")
+            return
+        self.crash_list.config(values=names, state="readonly" if names else "disabled")
+        if names:
+            self.crash_list.current(0)
+            self._put(f"[*] 发现 {len(names)} 条崩溃记录\n", "dim")
+
+    def pull_crash(self):
+        name = self.crash_list.get()
+        if not name:
+            return
+        self._pull_names([name])
+
+    def pull_all_crashes(self):
+        if self.platform == "ios":
+            def work():
+                files, err = self._crash_helper().crash_pull_all(self.crash_dir)
+                return files, err
+            threading.Thread(target=lambda: self._pull_ios_done(*work()), daemon=True).start()
+            self._put("[*] 正在拉取 iOS 崩溃日志...\n", "dim")
+            return
+        names = list(self.crash_list.cget("values") or [])
+        self._pull_names(names)
+
+    def _pull_ios_done(self, files, err):
+        if err:
+            self.app.log(f"[-] iOS 崩溃拉取失败: {err}")
+            self._put(f"[-] iOS 崩溃拉取失败: {err}\n", "err")
+            return
+        self._put(f"[+] 已拉取 {len(files)} 个 .ips -> {self.crash_dir}\n", "dim")
+        self.app.log(f"[+] iOS 崩溃日志 {len(files)} 个 -> {self.crash_dir}")
+
+    def _pull_names(self, names):
+        def work():
+            out = []
+            errs = []
+            for n in names:
+                p, e = self._crash_helper().crash_pull(n, self.crash_dir)
+                if p:
+                    out.append(p)
+                else:
+                    errs.append(f"{n}: {e}")
+            return out, errs
+        threading.Thread(target=lambda: self._pull_done(*work()), daemon=True).start()
+        self._put(f"[*] 正在拉取 {len(names)} 个崩溃日志...\n", "dim")
+
+    def _pull_done(self, files, errs):
+        if files:
+            self._put(f"[+] 已拉取 {len(files)} 个 -> {self.crash_dir}\n", "dim")
+            self.app.log(f"[+] 崩溃日志 {len(files)} 个 -> {self.crash_dir}")
+        for e in errs:
+            self._put(f"[-] {e}\n", "err")
+            self.app.log(f"[-] 崩溃拉取失败: {e}")
+
+    def open_crash_dir(self):
+        self.crash_dir.mkdir(parents=True, exist_ok=True)
+        subprocess.run(["open", str(self.crash_dir)])
+
+    def close(self):
+        self._want_stream = False
+        if self.proc is not None and self.proc.poll() is None:
+            self.proc.terminate()
+        if self._after_id:
+            try:
+                self.win.after_cancel(self._after_id)
+            except Exception:
+                pass
+        self.win.destroy()
+        self.app.log_wins.pop(self.platform, None)
 
 
 def main():

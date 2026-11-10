@@ -39,6 +39,20 @@ profile、重签名、校验）与 .ipa/.app 一致。
 选中任意描述文件后点 **ℹ️ 详情**：名称/类型/AppID/TeamID/设备数/有效期/路径，
 支持 **📂 打开所在路径**（Finder 定位）与 **📱 授权设备**（UDID 列表）。
 
+### 投屏与设备日志 (GUI)
+
+主界面「🖥️ 投屏」「📜 设备日志」按钮，按当前平台与所选设备打开：
+
+| 能力 | 鸿蒙 | iOS |
+|---|---|---|
+| 投屏 | `snapshot_display`+`file recv` 轮询，点击/拖拽/按键回传 (`uitest uiInput`) | `devicectl capture screenshot` 轮询，**只读**（系统无输入注入） |
+| 运行日志 | `hdc shell hilog` 流式 | `idevicesyslog`（需 `brew install libimobiledevice`） |
+| 崩溃日志 | `hidumper` 列表 + `file recv` 拉取 (jscrash/cppcrash) | `systemCrashLogs` 域整包拉取 (.ips) |
+
+崩溃日志保存于 `~/Downloads/hapdbg-crashes/<设备>/`；投屏帧率约 1~1.5 fps (鸿蒙) /
+0.5 fps (iOS)，签名安装界面的辅助查看用途足够。iOS 设备熄屏会断开 CoreDevice
+（设备列表变 unavailable），投屏/拉日志前请保持亮屏解锁。
+
 ### 重签名规则（关键，勿改）
 
 依据 Apple 官方文档《Creating distribution-signed code》《Using the latest code signature format》与 TN2206：
@@ -76,6 +90,7 @@ profile、重签名、校验）与 .ipa/.app 一致。
 | `hap_cli.py` | 核心 CLI（签名/安装/云接口/签名信息解析） |
 | `hap_gui.py` | 图形界面（tkinter + tkinterdnd2，拖拽，鸿蒙/iOS 双平台） |
 | `ios_sign.py` | iOS 签名 CLI/库（codesign 重签名 + devicectl 安装） |
+| `device_tools.py` | 设备投屏 + 运行/崩溃日志抓取（鸿蒙 hdc + iOS devicectl，双平台） |
 | `hap_sniff.py` | 本地 MITM 代理，抓取 app 对华为云的真实请求 |
 | `run_gui.command` | 双击启动 GUI |
 | `run_capture.sh` | 一键抓包（信任 CA + 起代理 + 起 app） |

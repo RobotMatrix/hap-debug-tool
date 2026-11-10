@@ -2,6 +2,33 @@
 
 所有显著变更记录在本文件。格式参考 Keep a Changelog。
 
+## [Unreleased] - 2026-11-10 (2)
+
+### Added - 设备投屏 + 日志抓取 (双平台, 参考 HoKit 功能设计)
+
+**新模块 `device_tools.py`** (纯标准库, macOS 系统工具链 + 内置 hdc):
+
+- 投屏: 截屏轮询方案。鸿蒙 `snapshot_display`+`file recv`+sips (~0.7s/帧, GIF
+  兼容 Tk 8.5/8.6); iOS `devicectl capture screenshot` (~2s/帧, 原生 PNG)
+- 输入回传 (鸿蒙): `uitest uiInput` 点击/双击/滑动/Home/返回/电源键; iOS 系统
+  无输入注入 API, 只读投屏
+- 运行日志: 鸿蒙 `hdc shell hilog` 流式 (可按 level 过滤); iOS `idevicesyslog`
+  流式 (需 brew libimobiledevice)
+- 崩溃日志: 鸿蒙 `hidumper -s HiviewFaultLogger` 列表 + `hdc file recv` 逐个
+  拉取 (shell 层 /data/log 权限拒绝, 但 file recv 走 faultloggerd 通道可直拉,
+  实测 jscrash/cppcrash 均通过); iOS `copy from --domain-type systemCrashLogs`
+  整包拉取 (.ips)
+- 子进程走 `posix_spawn` + 超时 `killpg` (规避 Tk 主循环并存时的
+  fork-exec 死锁与 hdc 设备端会话撑住管道导致的永久挂起)
+
+**GUI (`hap_gui.py`)**:
+
+- 主界面新增「🖥️ 投屏」「📜 设备日志」按钮 (双平台通用, 按当前平台+设备打开)
+- `MirrorWindow`: 投屏窗口, 状态/FPS 实时显示, 点击=触摸、拖拽=滑动 (鸿蒙),
+  Home/返回按键栏, 截图保存
+- `DeviceLogWindow`: 运行日志流 (关键词过滤/级别过滤/暂停/保存), 崩溃日志
+  下拉列表+单条/全部拉取, 产物落 `~/Downloads/hapdbg-crashes/<设备>/`
+
 ## [Unreleased] - 2026-11-10
 
 ### Added - iOS 签名支持 .xcarchive (Xcode 归档)

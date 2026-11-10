@@ -93,6 +93,7 @@ GUI iOS 设置面板有「📉 最低系统版本」输入框（默认 13.0）�
 |---|---|---|
 | 安装报 `0xe800801c No code signature found` | 壳厂漏签某个嵌套 framework | `install` 已自动重签 |
 | 安装报 `0xe8008015 A valid provisioning profile...not found` | entitlements 缺 `application-identifier` | 已修复：fallback 内嵌 profile |
+| 安装报 `0xe80000be application-identifier entitlement does not match` | 设备已装同 bundle id 但签名不同 (换证书/团队) | 自动卸载旧版重装 (ios-deploy/devicectl 双通道) |
 | 启动即死 `spawn error 88 Malformed Mach-o file` | `--options runtime`（CD flags 0x10000）或冗余 hardened-process entitlements 与壳包二进制不兼容 | 已修复：无 runtime + entitlements 白名单 |
 | 安装报 `MismatchedApplicationIdentifierEntitlement` | 固定 bundle id 的 profile 与设备上已装旧版冲突 | GUI 预检告警；卸载旧版或换通配 profile |
 

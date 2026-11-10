@@ -2,6 +2,18 @@
 
 所有显著变更记录在本文件。格式参考 Keep a Changelog。
 
+## [Unreleased] - 2026-11-10 (8)
+
+### Added - 安装遇 0xe80000be 自动卸载旧版重装
+
+- 场景: 设备已装同 bundle id 但签名 (team/entitlement) 不同的包, 升级被拒
+  `0xe80000be This application's application-identifier entitlement does not
+  match...` (OnlyHello 实测)
+- `install_to_device` 两通道均处理: ios-deploy (老设备) 与 devicectl (iOS 17+)
+  检测到该错误码后自动卸载旧版 → 重装一次 (ios-deploy 通道防递归, 只重试一次)
+- 真机验证: 伪 team entitlement 签名包触发冲突 → 日志提示 → 卸载 → 重装成功
+  (对齐鸿蒙 9568332 签名不一致自动卸载重装的既有行为)
+
 ## [Unreleased] - 2026-11-10 (7)
 
 ### Fixed - dmg/Finder 启动的 GUI 探测不到 brew 工具 (ios-deploy 回退失效)

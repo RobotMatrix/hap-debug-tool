@@ -973,8 +973,30 @@ def _find_tool(name):
     return None
 
 
-def _install_via_ios_deploy(ipa_path, device_udid=None, timeout=600):
-    """ios-deploy 安装 (iOS 13/14 老设备唯一可用通道)。返回输出文本。"""
+def _read_bundle_id_of_ipa(ipa_path):
+    """读 ipa 内主 app 的 bundle id (供 0xe80000be 自动卸载用)。"""
+    with zipfile.ZipFile(ipa_path) as z:
+        for n in z.namelist():
+            if n.endswith(".app/Info.plist") and n.count("/") == 2:
+                return plistlib.load(z.open(n)).get("CFBundleIdentifier", "")
+    return ""
+
+
+def _uninstall_legacy_app(device_udid, bundle_id):
+    """卸载老设备上的 app (ideviceinstaller)。返回 True=成功。"""
+    inst = _find_tool("ideviceinstaller")
+    if not inst or not bundle_id:
+        return False
+    rc, out, err = _run([inst, "-u", device_udid, "uninstall", bundle_id], timeout=120)
+    return rc == 0 and "Complete" in (out + err)
+
+
+_E80000BE_MARK = "0xe80000be"
+
+
+def _install_via_ios_deploy(ipa_path, device_udid=None, timeout=600, allow_reinstall=True):
+    """ios-deploy 安装 (iOS 13/14 老设备唯一可用通道)。返回输出文本。
+    0xe80000be (设备已装同 bundle id 但签名不同, 升级被拒) 时自动卸载旧版重装一次。"""
     ios_deploy = _find_tool("ios-deploy")
     if not ios_deploy:
         raise RuntimeError(
@@ -983,6 +1005,16 @@ def _install_via_ios_deploy(ipa_path, device_udid=None, timeout=600):
         else [ios_deploy, "--bundle", ipa_path]
     p = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
     out = (p.stdout or "") + (p.stderr or "")
+    if (p.returncode != 0 or "Installed package" not in out) and _E80000BE_MARK in out \
+            and allow_reinstall:
+        bid = _read_bundle_id_of_ipa(ipa_path)
+        print(f"[-] 设备已装同 bundle id ({bid}) 但签名不同 (0xe80000be) -> 自动卸载旧版重装")
+        if _uninstall_legacy_app(device_udid, bid):
+            return _install_via_ios_deploy(ipa_path, device_udid, timeout=timeout,
+                                           allow_reinstall=False)
+        raise RuntimeError(
+            f"0xe80000be 签名冲突且自动卸载失败 (ideviceinstaller 不可用或卸载报错)。"
+            f"请手动卸载设备上的 {bid} 后重试")
     if p.returncode != 0 or "Installed package" not in out:
         m = re.search(r"Error (0x[0-9a-fA-F]+[^\r\n]*)", out)
         raise RuntimeError(f"ios-deploy 安装失败 (rc={p.returncode}):\n"
@@ -1049,6 +1081,14 @@ def install_to_device(ipa_path, device_id=None, timeout=300, identity=None):
             print(f"[+] 自动重签产物: {fixed}")
     rc, out, err = _run(["xcrun", "devicectl", "device", "install", "app",
                          "--device", device_id, ipa_path], timeout=timeout)
+    if rc != 0 and _E80000BE_MARK in (err + out):
+        # 设备已装同 bundle id 但签名不同, 升级被拒 -> 卸载旧版重装
+        bid = _read_bundle_id_of_ipa(ipa_path)
+        print(f"[-] 设备已装同 bundle id ({bid}) 但签名不同 (0xe80000be) -> 自动卸载旧版重装")
+        _run(["xcrun", "devicectl", "device", "uninstall", "app",
+              "--device", device_id, bid], timeout=timeout)
+        rc, out, err = _run(["xcrun", "devicectl", "device", "install", "app",
+                             "--device", device_id, ipa_path], timeout=timeout)
     if rc != 0:
         # devicectl 失败且设备可能是老设备 (40 位 hex usbmuxd UDID 与 00008xxx CoreDevice UDID
         # 同机异构): 若 usbmuxd 有老设备, 回退 ios-deploy 再试一次

@@ -184,6 +184,37 @@ def extract_ipa(ipa_path, dest, keep_signature=False):
     return apps[0]
 
 
+def find_app_in_xcarchive(archive_dir):
+    """
+    在 .xcarchive 目录里定位主应用 .app。
+    标准布局: <name>.xcarchive/Products/Applications/<App>.app
+    容错: 传入 xcarchive 内部子目录时向上回溯到归档根; Applications 下多个 .app
+    (extension/watch app) 时按 Info.plist 主入口键甄别主包, 兜底取第一个。
+    """
+    p = Path(archive_dir)
+    if not p.name.endswith(".xcarchive"):
+        for anc in p.parents:
+            if anc.name.endswith(".xcarchive"):
+                p = anc
+                break
+    apps = sorted(p.rglob("*.app"))
+    if not apps:
+        raise ValueError(f"xcarchive 内未找到 .app: {archive_dir}")
+    if len(apps) == 1:
+        return apps[0]
+    # 多个 .app: 主 app 是唯一一个非 extension 的 (extension 的 Info.plist 无主入口键)
+    for a in apps:
+        try:
+            with open(a / "Info.plist", "rb") as f:
+                pl = plistlib.load(f)
+        except Exception:
+            continue
+        if any(k in pl for k in ("WKApplication", "NSExtension", "WKWatchOnly")):
+            continue
+        return a
+    return apps[0]
+
+
 def find_embedded_provision(app_dir):
     """在 .app 里找 embedded.mobileprovision"""
     for name in ("embedded.mobileprovision", "embedded.provisionprofile"):
@@ -213,6 +244,14 @@ def get_embedded_provision(ipa_or_app, cache_dir=None):
             if not embedded:
                 return None
             shutil.copy2(embedded, out)
+        return out
+    if p.suffix.lower() == ".xcarchive":
+        out = cache_dir / f"{p.stem}_embedded.mobileprovision"
+        app_dir = find_app_in_xcarchive(p)
+        embedded = find_embedded_provision(app_dir)
+        if not embedded:
+            return None
+        shutil.copy2(embedded, out)
         return out
     embedded = find_embedded_provision(app_dir)
     return embedded
@@ -360,7 +399,9 @@ def sign_app_source(src, out_dir, identity, provision_path=None,
     out_dir.mkdir(parents=True, exist_ok=True)
 
     app = src
-    if not app.name.endswith(".app"):
+    if src.suffix.lower() == ".xcarchive":
+        app = find_app_in_xcarchive(src)
+    elif not app.name.endswith(".app"):
         subs = [d for d in app.iterdir() if d.is_dir() and d.name.endswith(".app")]
         if len(subs) == 1:
             app = subs[0]
@@ -398,7 +439,7 @@ def read_bundle_id(app_dir):
 # ---------------------------------------------------------------- auto provision match
 
 def _read_bundle_id_of(src):
-    """读 .ipa / .app / 含 .app 目录的 bundle-id (不落盘)。"""
+    """读 .ipa / .app / .xcarchive / 含 .app 目录的 bundle-id (不落盘)。"""
     src = Path(src)
     if src.suffix == ".app":
         return read_bundle_id(src)
@@ -408,6 +449,8 @@ def _read_bundle_id_of(src):
                 if n.endswith(".app/Info.plist") and n.count("/") == 2:
                     return plistlib.load(z.open(n)).get("CFBundleIdentifier", "")
         raise FileNotFoundError(f"{src} 内未找到 Info.plist")
+    if src.suffix == ".xcarchive":
+        return read_bundle_id(find_app_in_xcarchive(src))
     if src.is_dir():
         apps = list(src.rglob("*.app"))
         if apps:
@@ -528,19 +571,24 @@ def set_bundle_id(app_dir, bundle_id):
 
 
 def verify(app_or_ipa):
-    """codesign --verify --deep --strict; ipa 先解包. 返回 (ok, 输出)"""
+    """codesign --verify --deep --strict; ipa 先解包; xcarchive 取主 app. 返回 (ok, 输出)"""
     p = Path(app_or_ipa)
-    if p.suffix == ".ipa":
-        with tempfile.TemporaryDirectory(prefix="iossign_") as td:
-            app = extract_ipa(p, td, keep_signature=True)
-            rc, out, err = _run(["codesign", "--verify", "--deep", "--strict", str(app)])
-            detail = (err.strip() or out.strip())
-            rc2, out2, _ = _run(["codesign", "-dv", "--verbose=4", str(app)])
-            return rc == 0, (detail + "\n" + out2.strip()).strip()
-    rc, out, err = _run(["codesign", "--verify", "--deep", "--strict", str(p)])
-    detail = (err.strip() or out.strip())
-    rc2, out2, _ = _run(["codesign", "-dv", "--verbose=4", str(p)])
-    return rc == 0, (detail + "\n" + out2.strip()).strip()
+    tmp = None
+    try:
+        if p.suffix == ".ipa":
+            tmp = tempfile.TemporaryDirectory(prefix="iossign_")
+            target = extract_ipa(p, tmp.name, keep_signature=True)
+        elif p.suffix.lower() == ".xcarchive":
+            target = find_app_in_xcarchive(p)
+        else:
+            target = p
+        rc, out, err = _run(["codesign", "--verify", "--deep", "--strict", str(target)])
+        detail = (err.strip() or out.strip())
+        rc2, out2, _ = _run(["codesign", "-dv", "--verbose=4", str(target)])
+        return rc == 0, (detail + "\n" + out2.strip()).strip()
+    finally:
+        if tmp:
+            tmp.cleanup()
 
 
 def _fmt_ts(ts):
@@ -552,7 +600,7 @@ def _fmt_ts(ts):
 
 def read_sign_info(app_or_ipa):
     """
-    汇总 .ipa/.app 的签名信息 (对齐 hap_cli.read_sign_info 的角色):
+    汇总 .ipa/.app/.xcarchive 的签名信息 (对齐 hap_cli.read_sign_info 的角色):
       signed / summary / detail / team / provision{...} / cert{...}
     """
     p = Path(app_or_ipa)
@@ -561,6 +609,8 @@ def read_sign_info(app_or_ipa):
     if p.suffix == ".ipa":
         tmp = tempfile.TemporaryDirectory(prefix="iossign_info_")
         app_dir = extract_ipa(p, tmp.name, keep_signature=True)
+    elif p.suffix.lower() == ".xcarchive":
+        app_dir = find_app_in_xcarchive(p)
     app_dir = Path(app_dir)
 
     rc, out, err = _run(["codesign", "--verify", "--deep", "--strict", str(app_dir)])
@@ -785,7 +835,7 @@ def main():
     s = sub.add_parser("provision", help="解析描述文件")
     s.add_argument("path")
 
-    s = sub.add_parser("sign", help="签名 .ipa / .app")
+    s = sub.add_parser("sign", help="签名 .ipa / .app / .xcarchive")
     s.add_argument("path")
     s.add_argument("-i", "--identity", required=True, help="证书 common name 或 SHA-1")
     s.add_argument("-p", "--provision", help=".mobileprovision 路径")
@@ -797,7 +847,7 @@ def main():
     s = sub.add_parser("verify", help="校验签名")
     s.add_argument("path")
 
-    s = sub.add_parser("install", help="安装 ipa 到设备")
+    s = sub.add_parser("install", help="安装 ipa/app/xcarchive 到设备")
     s.add_argument("path")
     s.add_argument("-d", "--device", help="设备 UDID (默认第一台可用)")
     s.add_argument("-i", "--identity", help="自动重签用的证书 (检测到未签名组件时启用; 默认取第一张可用证书)")

@@ -12,17 +12,22 @@
 
 ## iOS 签名 (ios_sign.py)
 
-GUI 顶部选「iOS」即进入 iOS 模式：拖入 `.ipa` / `.app` → 选钥匙串证书 + 描述文件 →
+GUI 顶部选「iOS」即进入 iOS 模式：拖入 `.ipa` / `.app` / `.xcarchive` → 选钥匙串证书 + 描述文件 →
 codesign 重签名 → 校验 → `xcrun devicectl` 安装。纯 macOS 系统工具链（`security`/`codesign`/`devicectl`），零第三方依赖。
 
 ```bash
 python3 ios_sign.py identities            # 列出钥匙串签名身份
 python3 ios_sign.py provision xx.mobileprovision
 python3 ios_sign.py sign app.ipa -i "Apple Development: ..." -p xx.mobileprovision -o out.ipa
+python3 ios_sign.py sign MyApp.xcarchive -i "Apple Development: ..."   # 直接签 xcarchive
 python3 ios_sign.py verify out.ipa
 python3 ios_sign.py install out.ipa       # devicectl 安装到已连接设备
 python3 ios_sign.py launch com.foo.bar
 ```
+
+`.xcarchive` 自动定位 `Products/Applications/` 下的主应用（含 extension 时按
+Info.plist 主入口键甄别），其余流程（embedded.mobileprovision 提取、自动匹配
+profile、重签名、校验）与 .ipa/.app 一致。
 
 ### 描述文件三种来源（GUI 描述文件下拉框）
 

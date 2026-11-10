@@ -2,6 +2,20 @@
 
 所有显著变更记录在本文件。格式参考 Keep a Changelog。
 
+## [Unreleased] - 2026-11-10
+
+### Added - iOS 签名支持 .xcarchive (Xcode 归档)
+
+- `ios_sign.py` 新增 `find_app_in_xcarchive()`：自动定位
+  `Products/Applications/` 下的主应用；归档内含多个 `.app`（extension/watch app）
+  时按 Info.plist 主入口键（WKApplication / NSExtension / WKWatchOnly）甄别主包
+- `sign`（CLI）与 `sign_app_source` / `get_embedded_provision` /
+  `_read_bundle_id_of`（自动匹配 profile） / `verify` / `read_sign_info` 全部接受
+  `.xcarchive` 输入，行为与 .ipa/.app 一致
+- CLI `sign` 输出 `<xcarchive名>-signed.ipa`（默认当前目录，`-o` 可指定）
+- GUI：拖拽/文件框接受 `.xcarchive`，检测到后自动切 iOS 模式；
+  「安装包自带」描述文件支持从 xcarchive 提取；预检/重签管线适配
+
 ## [Unreleased] - 2026-09-30
 
 ### Fixed - iOS 重签名后启动失败（spawn error 88 "Malformed Mach-o file"）

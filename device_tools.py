@@ -23,6 +23,20 @@ from pathlib import Path
 
 SHOT_REMOTE = "/data/local/tmp/hapdbg_mirror.jpeg"
 
+_BREW_DIRS = ("/opt/homebrew/bin", "/usr/local/bin")
+
+
+def _find_tool(name):
+    """shutil.which + brew 常见目录兜底 (Finder/dmg 启动的 GUI PATH 不含 homebrew)。"""
+    p = shutil.which(name)
+    if p:
+        return p
+    for d in _BREW_DIRS:
+        cand = os.path.join(d, name)
+        if os.path.isfile(cand) and os.access(cand, os.X_OK):
+            return cand
+    return None
+
 
 def _resolve_exe(cmd):
     """posix_spawn 需要 absolute path (不查 PATH)。"""
@@ -275,9 +289,10 @@ class IOSScreen:
     def grab(self, png_path):
         t0 = time.time()
         if self.legacy:
-            if not shutil.which("idevicescreenshot"):
+            idevice_shot = _find_tool("idevicescreenshot")
+            if not idevice_shot:
                 return False, 0, ("老设备投屏需要 libimobiledevice: brew install libimobiledevice")
-            rc, out, err = _run_capture(["idevicescreenshot", "-u", self.udid,
+            rc, out, err = _run_capture([idevice_shot, "-u", self.udid,
                                          str(png_path)], timeout=15)
             if rc != 0 or not Path(png_path).exists():
                 return False, 0, (err.strip() or out.strip() or "截图失败")

@@ -2,6 +2,18 @@
 
 所有显著变更记录在本文件。格式参考 Keep a Changelog。
 
+## [Unreleased] - 2026-11-10 (7)
+
+### Fixed - dmg/Finder 启动的 GUI 探测不到 brew 工具 (ios-deploy 回退失效)
+
+- 实战背景: v0.7.3 GUI 装 iOS 13.5 设备仍报 `devicectl 安装失败 4016`——
+  回退分支实际走到了, 但 Finder/dmg 启动的 GUI PATH 无 `/opt/homebrew/bin`,
+  `shutil.which("idevice_id")` 探测失败 → 误判「无老设备」→ 直接抛错
+- 新增 `_find_tool()`: `shutil.which` + `/opt/homebrew/bin`、`/usr/local/bin`
+  兜底 (ios_sign 与 device_tools 同步); `_usbmux_legacy_devices`/`idevicescreenshot`
+  全部改用绝对路径调用
+- 受限 PATH (`/usr/bin:/bin:...`) 端到端复测: 探测 → 指定老设备安装成功
+
 ## [Unreleased] - 2026-11-10 (6)
 
 ### Fixed - 投屏清晰度/流畅度 + Added - iOS 多设备指定

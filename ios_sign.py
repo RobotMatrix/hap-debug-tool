@@ -939,24 +939,48 @@ def _unsigned_nested_bundles(ipa_path):
 
 def _usbmux_legacy_devices():
     """usbmuxd 通道的 iOS<17 老设备 [(udid_40hex, name, ios_ver)]。devicectl 看不到它们
-    (无 CoreDevice), 安装需 ios-deploy。libimobiledevice 未装时返回空。"""
-    if not shutil.which("idevice_id"):
+    (无 CoreDevice), 安装需 ios-deploy。libimobiledevice 未装时返回空。
+    GUI 从 Finder/dmg 启动时 PATH 无 /opt/homebrew/bin, 需显式并入搜索路径。"""
+    idevice_id = _find_tool("idevice_id")
+    if not idevice_id:
         return []
+    idevice_info = _find_tool("ideviceinfo")
     devs = []
-    for u in _run(["idevice_id", "-l"])[1].split():
-        name = _run(["ideviceinfo", "-u", u, "-k", "DeviceName"])[1].strip() or "iPhone"
-        ver = _run(["ideviceinfo", "-u", u, "-k", "ProductVersion"])[1].strip() or "?"
+    for u in _run([idevice_id, "-l"])[1].split():
+        info_cmd = idevice_info or "ideviceinfo"
+        name = _run([info_cmd, "-u", u, "-k", "DeviceName"])[1].strip() or "iPhone"
+        ver = _run([info_cmd, "-u", u, "-k", "ProductVersion"])[1].strip() or "?"
         devs.append((u, name, ver))
     return devs
 
 
+_EXTRA_TOOL_DIRS = (
+    "/opt/homebrew/bin",      # Apple Silicon Homebrew
+    "/usr/local/bin",         # Intel Homebrew
+)
+
+
+def _find_tool(name):
+    """shutil.which + brew 常见目录兜底 (Finder/dmg 启动的 GUI PATH 不含 homebrew)。
+    返回绝对路径或 None。"""
+    p = shutil.which(name)
+    if p:
+        return p
+    for d in _EXTRA_TOOL_DIRS:
+        cand = os.path.join(d, name)
+        if os.path.isfile(cand) and os.access(cand, os.X_OK):
+            return cand
+    return None
+
+
 def _install_via_ios_deploy(ipa_path, device_udid=None, timeout=600):
     """ios-deploy 安装 (iOS 13/14 老设备唯一可用通道)。返回输出文本。"""
-    if not shutil.which("ios-deploy"):
+    ios_deploy = _find_tool("ios-deploy")
+    if not ios_deploy:
         raise RuntimeError(
             "目标为 iOS<17 老设备, 需要 ios-deploy 安装: brew install ios-deploy")
-    cmd = ["ios-deploy", "--id", device_udid, "--bundle", ipa_path] if device_udid \
-        else ["ios-deploy", "--bundle", ipa_path]
+    cmd = [ios_deploy, "--id", device_udid, "--bundle", ipa_path] if device_udid \
+        else [ios_deploy, "--bundle", ipa_path]
     p = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
     out = (p.stdout or "") + (p.stderr or "")
     if p.returncode != 0 or "Installed package" not in out:

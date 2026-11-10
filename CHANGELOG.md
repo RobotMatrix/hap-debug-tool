@@ -2,6 +2,19 @@
 
 所有显著变更记录在本文件。格式参考 Keep a Changelog。
 
+## [Unreleased] - 2026-11-10 (4)
+
+### Added - `install` 自动回退 ios-deploy (iOS<17 老设备)
+
+- 实战背景: GUI/CLI `install` 走 devicectl (iOS 17+ CoreDevice), 对 iOS 13/14
+  老设备永远报 `unavailable 暂不可安装`, 实际设备在线且可装
+- `install_to_device` 双通道: devicectl 无可用物理设备或安装失败时, 查 usbmuxd
+  (`idevice_id`), 发现有 iOS<17 老设备自动回退 `ios-deploy --id <40位hex> --bundle`
+  - libimobiledevice 未安装时维持原报错; ios-deploy 缺失给出明确 brew 安装提示
+- 两通道 UDID 异构 (40 位 hex vs 00008xxx-xxx CoreDevice), 自动桥接无需手动区分
+- GUI `install` 走同一函数, 无需改动即生效
+- 真机验证: iPhone X (iOS 13.6) `ios_sign.py install` 自动选 ios-deploy 装包成功
+
 ## [Unreleased] - 2026-11-10 (3)
 
 ### Added - `sign --min-os` 降最低系统版本 (老设备装高版本标高的包)

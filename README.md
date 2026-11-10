@@ -36,6 +36,10 @@ profile、重签名、校验）与 .ipa/.app 一致。
 自动整体重签。适用于二进制实际未用新系统 API、仅 SDK 构建默认标高的包；若真用了
 新 API，安装能过但启动时 dyld 报符号缺失。
 
+`install` 双通道：iOS 17+ 走 `devicectl`；iOS<17 老设备（devicectl 显示
+unavailable 但 usbmuxd 可见）自动回退 `ios-deploy`（需 `brew install ios-deploy`）。
+两通道 UDID 异构（40 位 hex vs `00008xxx-xxx`），GUI/CLI 无需手动区分。
+
 ### 描述文件三种来源（GUI 描述文件下拉框）
 
 1. **📦 安装包自带**（默认第一项）——自动提取 ipa 内 `embedded.mobileprovision`，缓存于

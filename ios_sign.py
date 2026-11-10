@@ -907,9 +907,40 @@ def _unsigned_nested_bundles(ipa_path):
         return []
 
 
+def _usbmux_legacy_devices():
+    """usbmuxd 通道的 iOS<17 老设备 [(udid_40hex, name, ios_ver)]。devicectl 看不到它们
+    (无 CoreDevice), 安装需 ios-deploy。libimobiledevice 未装时返回空。"""
+    if not shutil.which("idevice_id"):
+        return []
+    devs = []
+    for u in _run(["idevice_id", "-l"])[1].split():
+        name = _run(["ideviceinfo", "-u", u, "-k", "DeviceName"])[1].strip() or "iPhone"
+        ver = _run(["ideviceinfo", "-u", u, "-k", "ProductVersion"])[1].strip() or "?"
+        devs.append((u, name, ver))
+    return devs
+
+
+def _install_via_ios_deploy(ipa_path, device_udid=None, timeout=600):
+    """ios-deploy 安装 (iOS 13/14 老设备唯一可用通道)。返回输出文本。"""
+    if not shutil.which("ios-deploy"):
+        raise RuntimeError(
+            "目标为 iOS<17 老设备, 需要 ios-deploy 安装: brew install ios-deploy")
+    cmd = ["ios-deploy", "--id", device_udid, "--bundle", ipa_path] if device_udid \
+        else ["ios-deploy", "--bundle", ipa_path]
+    p = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
+    out = (p.stdout or "") + (p.stderr or "")
+    if p.returncode != 0 or "Installed package" not in out:
+        m = re.search(r"Error (0x[0-9a-fA-F]+[^\r\n]*)", out)
+        raise RuntimeError(f"ios-deploy 安装失败 (rc={p.returncode}):\n"
+                           f"{m.group(1).strip() if m else out.strip()[-500:]}")
+    return out.strip().splitlines()[-1]
+
+
 def install_to_device(ipa_path, device_id=None, timeout=300, identity=None):
     """安装 ipa 到设备. device_id 为空时选第一台可用的物理设备; 无可用时给出具体原因.
-    identity 给出时, 检测到未签名嵌套 bundle 会自动重签后安装"""
+    identity 给出时, 检测到未签名嵌套 bundle 会自动重签后安装.
+    设备通道自动选择: iOS 17+ 走 devicectl; iOS<17 老设备 (devicectl 显示 unavailable
+    但 usbmuxd 可见) 自动回退 ios-deploy."""
     ipa_path = str(ipa_path)
     devs = list_devices()
     physical = [d for d in devs if d[3]]
@@ -918,17 +949,25 @@ def install_to_device(ipa_path, device_id=None, timeout=300, identity=None):
         if not target:
             raise RuntimeError(f"未找到设备 {device_id}")
     else:
-        available = [d for d in physical if d[2] in ("Available", "connected", "Connected")]
+        available = [d for d in physical
+                     if d[2] in ("Available", "connected", "Connected")
+                     or d[2].lower().startswith("available")]
         if available:
             target = available[0]
         elif physical:
-            name, _id, state, _ = physical[0]
-            raise RuntimeError(
-                f"发现物理设备 '{name}' 但状态为 {state}, 暂不可安装。\n"
-                "  常见原因: 1) iPhone 已锁屏 -> 解锁后重试\n"
-                "           2) 未信任此电脑 -> iPhone 上点『信任』并输入密码\n"
-                "           3) 未开启开发者模式 -> 设置>隐私与安全性>开发者模式\n"
-                "           4) iOS 17+ 需要 Xcode/CoreDevice 服务, 打开一次 Xcode 或重插数据线")
+            # devicectl 全 unavailable: 可能整批是 iOS<17 老设备, 查 usbmuxd
+            legacy = _usbmux_legacy_devices()
+            if not legacy:
+                name, _id, state, _ = physical[0]
+                raise RuntimeError(
+                    f"发现物理设备 '{name}' 但状态为 {state}, 暂不可安装。\n"
+                    "  常见原因: 1) iPhone 已锁屏 -> 解锁后重试\n"
+                    "           2) 未信任此电脑 -> iPhone 上点『信任』并输入密码\n"
+                    "           3) 未开启开发者模式 -> 设置>隐私与安全性>开发者模式\n"
+                    "           4) iOS 17+ 需要 Xcode/CoreDevice 服务, 打开一次 Xcode 或重插数据线")
+            u, name, ver = legacy[0]
+            print(f"[*] devicectl 无可用设备; usbmuxd 发现老设备: {name} (iOS {ver}, {u[:16]}...) -> ios-deploy 通道")
+            return _install_via_ios_deploy(ipa_path, u)
         else:
             raise RuntimeError(f"没有物理 iOS 设备 (共 {len(devs)} 台, 均为模拟器/不可用)")
         device_id = target[0]
@@ -953,6 +992,13 @@ def install_to_device(ipa_path, device_id=None, timeout=300, identity=None):
     rc, out, err = _run(["xcrun", "devicectl", "device", "install", "app",
                          "--device", device_id, ipa_path], timeout=timeout)
     if rc != 0:
+        # devicectl 失败且设备可能是老设备 (40 位 hex usbmuxd UDID 与 00008xxx CoreDevice UDID
+        # 同机异构): 若 usbmuxd 有老设备, 回退 ios-deploy 再试一次
+        legacy = _usbmux_legacy_devices()
+        if legacy:
+            u, name, ver = legacy[0]
+            print(f"[-] devicectl 安装失败, 回退 ios-deploy ({name}, iOS {ver})")
+            return _install_via_ios_deploy(ipa_path, u)
         raise RuntimeError(f"devicectl 安装失败 (rc={rc}):\n{err.strip() or out.strip()}")
     return (out or err).strip()
 

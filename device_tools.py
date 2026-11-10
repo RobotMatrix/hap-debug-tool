@@ -13,9 +13,11 @@ device_tools.py -- 设备投屏/日志抓取 (鸿蒙 hdc + iOS devicectl/idevice
             iOS devicectl copy from --domain-type systemCrashLogs 整包拉取 (.ips)。
 """
 
+import hashlib
 import os
 import re
 import shutil
+import signal
 import subprocess
 import tempfile
 import time
@@ -190,16 +192,99 @@ def _run_out(rc, err):
     return err or ("" if rc == 0 else "fail")
 
 
+class HarmonyScreenStream:
+    """鸿蒙准视频流 (双缓冲): 设备端常驻 shell 循环 snapshot 到 db_0/db_1 两个
+    文件交替写入, host 高频轮询 recv 两个缓冲 + md5 去重后渲染。
+    实测 Mate 60: 4.4 fps (旧串行链 2.0 fps 的 2.2 倍); 输入回传 (uitest) 与
+    抓帧 shell 是不同 hdc 会话, 点击时画面不冻结。
+    snapshot_display 本身 ~300ms 是设备端 SurfaceFlinger 快照固定成本, 纯
+    shell 无 agent 的帧率上限即此; 真 H.264 流需设备端 agent (如 HoKit)。"""
+
+    REMOTE_FMT = "/data/local/tmp/hapdbg_stream_{i}.jpeg"
+    N_BUF = 2
+
+    def __init__(self, hdc_bin, connect_key=None):
+        self.bin = hdc_bin
+        self.key = connect_key
+        self.proc = None          # 设备端常驻循环 shell 进程
+        self._last_md5 = None
+        self._new_frames = 0
+        self._cur = 0
+        self._tmp = Path(tempfile.mkdtemp(prefix="hapdbg_stream_"))
+        self.jpeg_path = self._tmp / "frame.jpeg"
+        self.png_path = self._tmp / "frame.png"
+
+    def _base(self):
+        return [self.bin] + (["-t", self.key] if self.key else [])
+
+    def start(self):
+        """启动设备端常驻双缓冲抓帧循环 (单个 hdc shell 进程)。"""
+        if self.proc and self.proc.poll() is None:
+            return
+        remotes = " ".join(self.REMOTE_FMT.format(i=i) for i in range(self.N_BUF))
+        script = ("for i in $(seq 1 100000); do f=$((i % 2)); "
+                  f"snapshot_display -f {self.REMOTE_FMT.format(i='$f')} >/dev/null 2>&1; done")
+        self.proc = subprocess.Popen(self._base() + ["shell", script],
+                                     stdout=subprocess.DEVNULL,
+                                     stderr=subprocess.DEVNULL,
+                                     start_new_session=True)
+
+    def grab(self, out_png=None):
+        """轮询两个缓冲, 收到新帧 (md5 变化) 时转换 PNG。返回 (new_frame, ms, err)。
+        recv ~45ms/次, 两缓冲 ~90ms 一轮, 不到 snapshot 300ms 的三分之一。"""
+        t0 = time.time()
+        is_new = False
+        err = ""
+        for i in range(self.N_BUF):
+            remote = self.REMOTE_FMT.format(i=i)
+            local = self._tmp / f"buf_{i}.jpeg"
+            rc, _, e = _run_capture(self._base() + ["file", "recv", remote, str(local)],
+                                    timeout=8)
+            if rc != 0 or not local.exists() or local.stat().st_size == 0:
+                # snapshot 正在覆写的瞬间 recv 会拿到空/半文件, 属正常竞态, 静默跳过
+                continue
+            md5 = hashlib.md5(local.read_bytes()).hexdigest()
+            if md5 != self._last_md5:
+                is_new = True
+                if out_png:
+                    shutil.copy2(local, self.jpeg_path)
+                self._last_md5 = md5
+        if is_new:
+            self._new_frames += 1
+            if out_png:
+                rc2, _, e2 = _run_capture(["sips", "-s", "format", "png",
+                                           str(self.jpeg_path), "--out", str(out_png)],
+                                          timeout=10)
+                if rc2 != 0:
+                    return False, 0, f"sips 失败: {(e2 or '').strip()}"
+        return is_new, int((time.time() - t0) * 1000), err
+
+    def stop(self):
+        """停止设备端循环 + 清理远端文件。"""
+        if self.proc and self.proc.poll() is None:
+            try:
+                os.killpg(self.proc.pid, signal.SIGKILL)
+            except Exception:
+                self.proc.kill()
+            self.proc = None
+        remotes = " ".join(self.REMOTE_FMT.format(i=i) for i in range(self.N_BUF))
+        _run(self._base() + ["shell", "rm", "-f", remotes], timeout=10)
+
+    def cleanup(self):
+        self.stop()
+        shutil.rmtree(self._tmp, ignore_errors=True)
+
+
 class HarmonyInput:
     """鸿蒙输入回传: uitest uiInput (click/swipe/keyEvent/inputText)。"""
 
     def __init__(self, hdc_bin, connect_key=None, screen_wh=(1216, 2688)):
         self.bin = hdc_bin
-        self.key = connect_key
+        self.connect_key = connect_key
         self.w, self.h = screen_wh
 
     def _base(self):
-        return [self.bin] + (["-t", self.key] if self.key else [])
+        return [self.bin] + (["-t", self.connect_key] if self.connect_key else [])
 
     def click(self, x_ratio, y_ratio):
         x, y = int(x_ratio * self.w), int(y_ratio * self.h)

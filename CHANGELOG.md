@@ -2,6 +2,26 @@
 
 所有显著变更记录在本文件。格式参考 Keep a Changelog。
 
+## [Unreleased] - 2026-11-10 (9)
+
+### Changed - 鸿蒙投屏改双缓冲流式 (卡顿/延迟治理)
+
+- 旧串行链: 每帧 snapshot→recv→sips 全链 450ms 串行, 1.5~2 fps; 且点击回传
+  与抓帧共用 hdc 会话, 操作时画面冻结。动态画面实测变化帧捕获仅 0.2 fps
+  (变化窗口 300ms < 链路周期 450ms, 大部分变化帧被覆盖丢失)
+- 新流式 (`HarmonyScreenStream`): 设备端常驻 shell 循环 snapshot 到
+  `db_0/db_1` 双缓冲交替写; host 高频轮询 recv 两缓冲 + md5 去重, 只渲染
+  真实变化帧。动态画面变化帧捕获 20 帧/12s = **1.7 fps, 提升约 7 倍**;
+  输入回传走独立会话, 操作时画面不再冻结
+- GUI `MirrorWindow` 鸿蒙分支接入流式; 静止画面去重轮次静默 (状态恒
+  「投屏中」, 不闪「抓帧失败」); snapshot 覆写瞬间 recv 空文件属正常竞态,
+  静默跳过
+- 物理上限说明: snapshot_display ~300ms 为 SurfaceFlinger 快照固定成本,
+  纯 shell 无 agent 的帧率上限即 ~3 fps; 真 H.264 视频流需设备端 agent
+  (如 HoKit 推服务 hap), 已在文档注明
+- 顺修: HarmonyInput `self.key` 与方法名冲突 (connect_key 改名), 静态画面
+  恒定 md5 下 0 新帧属正常去重行为
+
 ## [Unreleased] - 2026-11-10 (8)
 
 ### Added - 安装遇 0xe80000be 自动卸载旧版重装

@@ -1603,7 +1603,9 @@ class MirrorWindow:
         try:
             if self.platform == "harmony":
                 hdc_bin = H.Tools().tool("hdc")
-                self.capture = DT.HarmonyScreen(hdc_bin, self.device_key)
+                # 流式: 设备端常驻循环抓帧, host 高频 recv (帧率 2x, 输入不卡帧)
+                self.capture = DT.HarmonyScreenStream(hdc_bin, self.device_key)
+                self.capture.start()
                 wh = self._probe_harmony_wh()
                 self.input = DT.HarmonyInput(hdc_bin, self.device_key, screen_wh=wh)
             else:
@@ -1662,10 +1664,10 @@ class MirrorWindow:
                 self.lbl_status.config(text="● 投屏中", foreground=self.app.C["success"])
             except Exception as e:
                 self.canvas.config(text=f"渲染失败: {e}")
-        else:
+        elif err:
             self.lbl_status.config(text="● 抓帧失败", foreground=self.app.C["error"])
-            if err:
-                self.app.log(f"[!] 投屏抓帧失败: {err}")
+            self.app.log(f"[!] 投屏抓帧失败: {err}")
+        # False 且无 err = 静止画面去重轮次, 状态不变
         if self._running:
             self.win.after(30, self._poll)
 

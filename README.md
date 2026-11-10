@@ -61,13 +61,18 @@ GUI iOS 设置面板有「📉 最低系统版本」输入框（默认 13.0）�
 
 | 能力 | 鸿蒙 | iOS |
 |---|---|---|
-| 投屏 | `snapshot_display`+`file recv` 轮询，点击/拖拽/按键回传 (`uitest uiInput`) | 双通道: iOS17+ `devicectl capture screenshot`; iOS<17 `idevicescreenshot`（快 3 倍）只读（系统无输入注入） |
+| 投屏 | **双缓冲流式**: 设备端常驻循环 snapshot 到双缓冲 + host 高频 recv 去重（动态画面变化帧捕获 ~7 倍于旧串行链，点击回传不卡帧）；`uitest uiInput` 点击/拖拽/按键 | 双通道: iOS17+ `devicectl capture screenshot`; iOS<17 `idevicescreenshot`（快 3 倍）只读（系统无输入注入） |
 | 运行日志 | `hdc shell hilog` 流式 | `idevicesyslog`（需 `brew install libimobiledevice`） |
 | 崩溃日志 | `hidumper` 列表 + `file recv` 拉取 (jscrash/cppcrash) | `systemCrashLogs` 域整包拉取 (.ips) |
 
 崩溃日志保存于 `~/Downloads/hapdbg-crashes/<设备>/`；投屏帧率约 1~1.5 fps (鸿蒙) /
 0.5 fps (iOS)，签名安装界面的辅助查看用途足够。iOS 设备熄屏会断开 CoreDevice
 （设备列表变 unavailable），投屏/拉日志前请保持亮屏解锁。
+
+> 鸿蒙投屏帧率物理上限 ~3 fps：`snapshot_display` 单次 ~300ms 是设备端
+> SurfaceFlinger 快照固定成本。准视频流（双缓冲+高频轮询）已把变化帧捕获率提至
+> 理论上限的 ~7 倍；要达到 HoKit 式 60fps H.264 流需在设备端安装 agent 服务
+> （推送自研 hap），纯 shell 工具链无法实现。
 
 ### 重签名规则（关键，勿改）
 

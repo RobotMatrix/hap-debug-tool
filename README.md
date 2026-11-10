@@ -20,6 +20,7 @@ python3 ios_sign.py identities            # 列出钥匙串签名身份
 python3 ios_sign.py provision xx.mobileprovision
 python3 ios_sign.py sign app.ipa -i "Apple Development: ..." -p xx.mobileprovision -o out.ipa
 python3 ios_sign.py sign MyApp.xcarchive -i "Apple Development: ..."   # 直接签 xcarchive
+python3 ios_sign.py sign app.ipa -i "Apple Development: ..." --min-os 13.0  # 降最低系统版本
 python3 ios_sign.py verify out.ipa
 python3 ios_sign.py install out.ipa       # devicectl 安装到已连接设备
 python3 ios_sign.py launch com.foo.bar
@@ -28,6 +29,12 @@ python3 ios_sign.py launch com.foo.bar
 `.xcarchive` 自动定位 `Products/Applications/` 下的主应用（含 extension 时按
 Info.plist 主入口键甄别），其余流程（embedded.mobileprovision 提取、自动匹配
 profile、重签名、校验）与 .ipa/.app 一致。
+
+`--min-os X.Y`：老设备装高版本标高的包（如 iOS 13.5 设备装 `MinimumOSVersion
+15.0` 的包报 `0xe800007e device OS version is too low`）。同时改 Info.plist 与
+所有 Mach-O 的 `LC_BUILD_VERSION/LC_VERSION_MIN`（设备端安装校验两处都查），改后
+自动整体重签。适用于二进制实际未用新系统 API、仅 SDK 构建默认标高的包；若真用了
+新 API，安装能过但启动时 dyld 报符号缺失。
 
 ### 描述文件三种来源（GUI 描述文件下拉框）
 

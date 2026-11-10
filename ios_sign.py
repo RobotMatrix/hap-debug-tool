@@ -19,6 +19,7 @@ import os
 import plistlib
 import re
 import shutil
+import struct
 import subprocess
 import tempfile
 import time
@@ -361,10 +362,10 @@ def sign_app(app_dir, identity, provision_path=None, entitlements_plist=None,
 
 
 def sign_ipa(ipa_path, out_path, identity, provision_path=None,
-             entitlements_overrides=None, bundle_id=None):
+             entitlements_overrides=None, bundle_id=None, min_os=None):
     """
     重签名 .ipa:
-      解包 -> 重签 .app -> 压回新 ipa
+      解包 -> (可选降 min-os) -> 重签 .app -> 压回新 ipa
     返回产物路径
     """
     ipa_path = Path(ipa_path)
@@ -375,6 +376,9 @@ def sign_ipa(ipa_path, out_path, identity, provision_path=None,
         app = extract_ipa(ipa_path, td)
         if bundle_id:
             set_bundle_id(app, bundle_id)
+        if min_os:
+            _, desc = patch_min_os(app, min_os)
+            print(f"[*] 降最低系统版本: {desc}")
         sign_app(app, identity, provision_path, entitlements_overrides=entitlements_overrides)
         # 压回: 必须以 Payload/ 为根, 否则设备不认
         if out_path.exists():
@@ -389,9 +393,9 @@ def sign_ipa(ipa_path, out_path, identity, provision_path=None,
 
 
 def sign_app_source(src, out_dir, identity, provision_path=None,
-                    entitlements_overrides=None, bundle_id=None):
+                    entitlements_overrides=None, bundle_id=None, min_os=None):
     """
-    对 .app 目录(或包着 .app 的任意目录)重签名, 输出为 zip (Payload/xxx.app)
+    对 .app 目录(或包着 .app 的任意目录/.xcarchive)重签名, 输出为 zip (Payload/xxx.app)
     返回产物路径
     """
     src = Path(src)
@@ -417,6 +421,9 @@ def sign_app_source(src, out_dir, identity, provision_path=None,
     with tempfile.TemporaryDirectory(prefix="iossign_") as td:
         work_app = Path(td) / "Payload" / app.name
         shutil.copytree(app, work_app, symlinks=True)
+        if min_os:
+            _, desc = patch_min_os(work_app, min_os)
+            print(f"[*] 降最低系统版本: {desc}")
         sign_app(work_app, identity, provision_path, entitlements_overrides=entitlements_overrides)
         out = out_dir / f"{work_app.stem}-signed.ipa"
         if out.exists():
@@ -568,6 +575,135 @@ def set_bundle_id(app_dir, bundle_id):
     pl["CFBundleIdentifier"] = bundle_id
     with open(info, "wb") as f:
         plistlib.dump(pl, f)
+
+
+_MACHO_MAGICS = (b"\xcf\xfa\xed\xfe", b"\xce\xfa\xed\xfe", b"\xca\xfe\xba\xbe")
+_LC_BUILD_VERSION = 0x32          # minos 在 cmd+12
+_LC_VERSION_MIN_SET = {0x25, 0x2D, 0x2E, 0x2F}   # iphoneos/macosx/tvos/watchos, ver 在 cmd+8
+
+
+def _parse_ver(s):
+    m = re.match(r"(\d+)\.(\d+)(?:\.(\d+))?", str(s).strip())
+    if not m:
+        raise ValueError(f"版本号格式: X.Y[.Z], 收到 {s!r}")
+    return (int(m.group(1)), int(m.group(2)), int(m.group(3) or 0))
+
+
+def _pack_ver(v):
+    return (v[0] << 16) | (v[1] << 8) | v[2]
+
+
+def _patch_macho_minos(data, new_ver):
+    """原地改 LC_BUILD_VERSION.minos / LC_VERSION_MIN_*.version。返回 (新 bytes, 改了几处)。
+    FAT 二进制逐 thin slice 处理。"""
+    if data[:4] == b"\xca\xfe\xba\xbe":
+        out = bytearray(data)
+        narch = struct.unpack_from(">I", data, 4)[0]
+        patched = 0
+        for i in range(narch):
+            off, size, _align = struct.unpack_from(">III", data, 8 + i * 20)
+            sl, n = _patch_macho_minos(data[off:off + size], new_ver)
+            out[off:off + size] = sl
+            patched += n
+        return bytes(out), patched
+    if data[:4] not in (b"\xcf\xfa\xed\xfe", b"\xce\xfa\xed\xfe"):
+        return data, 0
+    buf = bytearray(data)
+    ncmds = struct.unpack_from("<I", buf, 16)[0]
+    off = 32 if data[:4] == b"\xcf\xfa\xed\xfe" else 28
+    ver = _pack_ver(new_ver)
+    patched = 0
+    for _ in range(ncmds):
+        cmd, size = struct.unpack_from("<II", buf, off)
+        if cmd == _LC_BUILD_VERSION:
+            struct.pack_into("<I", buf, off + 12, ver)
+            patched += 1
+        elif cmd in _LC_VERSION_MIN_SET:
+            struct.pack_into("<I", buf, off + 8, ver)
+            patched += 1
+        off += size
+    return bytes(buf), patched
+
+
+def _macho_minos_of(data):
+    """读 Mach-O 当前 minos (调试/验证用)。FAT 取第一个含 min 命令的 slice。"""
+    slices = []
+    if data[:4] == b"\xca\xfe\xba\xbe":
+        narch = struct.unpack_from(">I", data, 4)[0]
+        for i in range(narch):
+            off, size, _ = struct.unpack_from(">III", data, 8 + i * 20)
+            slices.append(data[off:off + size])
+    else:
+        slices = [data]
+    for s in slices:
+        if s[:4] not in (b"\xcf\xfa\xed\xfe", b"\xce\xfa\xed\xfe"):
+            continue
+        ncmds = struct.unpack_from("<I", s, 16)[0]
+        off = 32 if s[:4] == b"\xcf\xfa\xed\xfe" else 28
+        for _ in range(ncmds):
+            cmd, size = struct.unpack_from("<II", s, off)
+            if cmd == _LC_BUILD_VERSION:
+                minos = struct.unpack_from("<I", s, off + 12)[0]
+                return f"{minos >> 16}.{(minos >> 8) & 255}.{minos & 255}"
+            if cmd in _LC_VERSION_MIN_SET:
+                ver = struct.unpack_from("<I", s, off + 8)[0]
+                return f"{ver >> 16}.{(ver >> 8) & 255}.{ver & 255}"
+            off += size
+    return None
+
+
+def patch_min_os(app_dir, min_os):
+    """
+    把 .app 的最低系统版本降到 min_os (用于老设备装高版本标高的包, 如 iOS13.5 装 minOS15 包):
+      1. Info.plist MinimumOSVersion
+      2. 所有 Mach-O (主二进制 + Frameworks 内嵌二进制) 的 LC_BUILD_VERSION/LC_VERSION_MIN
+    仅改版本字段不动其他 load command; 改完必须重签 (codesign --force 会整体重签)。
+    返回 (改了几个 Mach-O, 旧值->新值 描述)。设备端安装校验同时依据 plist 与 load command,
+    只改 plist 不够 (0xe800007e 照样拒装)。
+    """
+    app_dir = Path(app_dir)
+    new_ver = _parse_ver(min_os)
+    info = app_dir / "Info.plist"
+    with open(info, "rb") as f:
+        pl = plistlib.load(f)
+    old = pl.get("MinimumOSVersion")
+    pl["MinimumOSVersion"] = f"{new_ver[0]}.{new_ver[1]}.{new_ver[2]}"
+    with open(info, "wb") as f:
+        plistlib.dump(pl, f)
+
+    binaries = []
+    exe = pl.get("CFBundleExecutable")
+    if exe and (app_dir / exe).exists():
+        binaries.append(app_dir / exe)
+    for sub in ("Frameworks", "PlugIns", "XPCServices"):
+        d = app_dir / sub
+        if not d.is_dir():
+            continue
+        for fw in d.iterdir():
+            if not fw.name.endswith((".framework", ".appex", ".xpc")):
+                continue
+            fi = fw / "Info.plist"
+            if fi.exists():
+                with open(fi, "rb") as f:
+                    fpl = plistlib.load(f)
+                fe = fpl.get("CFBundleExecutable")
+                if fe and (fw / fe).exists():
+                    binaries.append(fw / fe)
+            else:
+                binaries += [x for x in fw.iterdir() if x.is_file() and x.read_bytes()[:4] in _MACHO_MAGICS]
+
+    changed = 0
+    details = []
+    for b in binaries:
+        data = b.read_bytes()
+        before = _macho_minos_of(data)
+        new_data, n = _patch_macho_minos(data, new_ver)
+        if n:
+            b.write_bytes(new_data)
+            changed += 1
+            details.append(f"{b.name}: {before} -> {min_os} ({n} cmd)")
+    desc = f"MinimumOSVersion {old} -> {min_os}; " + "; ".join(details)
+    return changed, desc
 
 
 def verify(app_or_ipa):
@@ -857,6 +993,9 @@ def main():
     s.add_argument("-b", "--bundle-id", help="覆盖 CFBundleIdentifier")
     s.add_argument("-e", "--ent", action="append", default=[],
                    help="追加 entitlements 覆盖, key=value, 可多次")
+    s.add_argument("--min-os", dest="min_os",
+                   help="降最低系统版本 (如 13.0), 老设备装高版本标高的包用; "
+                        "同时改 Info.plist 与所有 Mach-O load command")
 
     s = sub.add_parser("verify", help="校验签名")
     s.add_argument("path")
@@ -909,9 +1048,11 @@ def main():
             if not provision:
                 raise SystemExit("[-] 自动匹配 profile 失败, 请用 -p 手动指定")
         if src.suffix == ".ipa":
-            got = sign_ipa(src, out, args.identity, provision, overrides, args.bundle_id)
+            got = sign_ipa(src, out, args.identity, provision, overrides, args.bundle_id,
+                           min_os=args.min_os)
         else:
-            got = sign_app_source(src, out.parent, args.identity, provision, overrides, args.bundle_id)
+            got = sign_app_source(src, out.parent, args.identity, provision, overrides,
+                                  args.bundle_id, min_os=args.min_os)
         print(f"[+] 已签名: {got}")
         ok, detail = verify(got)
         print(("[+] 校验通过" if ok else "[-] 校验失败") + "\n" + detail)

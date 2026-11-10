@@ -2,6 +2,20 @@
 
 所有显著变更记录在本文件。格式参考 Keep a Changelog。
 
+## [Unreleased] - 2026-11-10 (3)
+
+### Added - `sign --min-os` 降最低系统版本 (老设备装高版本标高的包)
+
+- 实战背景: iOS 13.5 越狱机装 `MinimumOSVersion 15.0` 的加固包报
+  `0xe800007e The device OS version is too low`。设备端安装校验同时依据
+  Info.plist 与 Mach-O load command, 只改 plist 无效
+- `ios_sign.py` 新增 `patch_min_os()`: 同时降 Info.plist `MinimumOSVersion` 与
+  所有 Mach-O (主二进制 + Frameworks/PlugIns/XPCServices 内嵌二进制, FAT 逐
+  slice) 的 `LC_BUILD_VERSION.minos` / `LC_VERSION_MIN_*.version`
+- `sign_ipa` / `sign_app_source` 透传 `min_os`; CLI `sign` 新增 `--min-os`
+- 真机验证: minOS 15 加固包降 13.0 重签后 ios-deploy 装入 iOS 13.5 成功
+  (启动崩溃系越狱环境 tweak 注入冲突, 与降级无关——原始未改包同机同崩)
+
 ## [Unreleased] - 2026-11-10 (2)
 
 ### Added - 设备投屏 + 日志抓取 (双平台, 参考 HoKit 功能设计)

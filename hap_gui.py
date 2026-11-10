@@ -159,6 +159,8 @@ class App:
         self.ios_prov_path = None
         self.mirror_win = None
         self.log_wins = {}
+        self._ios_devs = ([], "")
+        self._ios_dev_keys = []
 
         dark = is_dark_mode()
         C = {
@@ -319,18 +321,27 @@ class App:
         ioscfg.columnconfigure(1, weight=1)
         self.cfg_ios = ioscfg
 
-        ttk.Label(ioscfg, text="🪪  证书:").grid(row=0, column=0, sticky="e", padx=(0, 6), pady=4)
+        ttk.Label(ioscfg, text="📱  设备:").grid(row=0, column=0, sticky="e", padx=(0, 6), pady=4)
+        self.ios_device_var = tk.StringVar()
+        self.ios_device_box = ttk.Combobox(ioscfg, textvariable=self.ios_device_var,
+                                           state="readonly", width=30)
+        self.ios_device_box.grid(row=0, column=1, sticky="we", pady=3)
+        ttk.Button(ioscfg, text="🔄 刷新", command=self.refresh_ios_devices).grid(row=0, column=2, padx=(6, 0), pady=4)
+        self.ios_device_lbl = ttk.Label(ioscfg, text="", style="Sub.TLabel")
+        self.ios_device_lbl.grid(row=0, column=3, sticky="w", padx=(8, 0))
+
+        ttk.Label(ioscfg, text="🪪  证书:").grid(row=1, column=0, sticky="e", padx=(0, 6), pady=4)
         self.ios_identity_var = tk.StringVar()
         self.ios_identity_box = ttk.Combobox(ioscfg, textvariable=self.ios_identity_var, state="readonly")
-        self.ios_identity_box.grid(row=0, column=1, sticky="we", pady=3)
-        ttk.Button(ioscfg, text="🔄 刷新", command=self.refresh_ios_identities).grid(row=0, column=2, padx=(6, 0), pady=4)
+        self.ios_identity_box.grid(row=1, column=1, sticky="we", pady=3)
+        ttk.Button(ioscfg, text="🔄 刷新", command=self.refresh_ios_identities).grid(row=1, column=2, padx=(6, 0), pady=4)
 
-        ttk.Label(ioscfg, text="📄  描述文件:").grid(row=1, column=0, sticky="e", padx=(0, 6), pady=4)
+        ttk.Label(ioscfg, text="📄  描述文件:").grid(row=2, column=0, sticky="e", padx=(0, 6), pady=4)
         self.ios_prov_var = tk.StringVar()
         self.ios_prov_box = ttk.Combobox(ioscfg, textvariable=self.ios_prov_var, state="readonly")
-        self.ios_prov_box.grid(row=1, column=1, sticky="we", pady=3)
+        self.ios_prov_box.grid(row=2, column=1, sticky="we", pady=3)
         self.ios_prov_btns = ttk.Frame(ioscfg)
-        self.ios_prov_btns.grid(row=1, column=2, padx=(6, 0), pady=4)
+        self.ios_prov_btns.grid(row=2, column=2, padx=(6, 0), pady=4)
         ttk.Button(self.ios_prov_btns, text="🔄 刷新",
                    command=self.refresh_ios_profiles).pack(side="left")
         ttk.Button(self.ios_prov_btns, text="📂 本地",
@@ -339,16 +350,16 @@ class App:
                    command=self.show_ios_provision_detail).pack(side="left", padx=(4, 0))
         self.ios_prov_box.bind("<<ComboboxSelected>>", lambda e: self.on_ios_provision_selected())
 
-        ttk.Label(ioscfg, text="🆔  BundleID:").grid(row=2, column=0, sticky="e", padx=(0, 6), pady=4)
+        ttk.Label(ioscfg, text="🆔  BundleID:").grid(row=3, column=0, sticky="e", padx=(0, 6), pady=4)
         self.ios_bundle_var = tk.StringVar()
-        ttk.Entry(ioscfg, textvariable=self.ios_bundle_var).grid(row=2, column=1, sticky="we", pady=3)
-        ttk.Label(ioscfg, text="留空 = 保持原样", style="Sub.TLabel").grid(row=2, column=2, sticky="w", padx=(6, 0))
+        ttk.Entry(ioscfg, textvariable=self.ios_bundle_var).grid(row=3, column=1, sticky="we", pady=3)
+        ttk.Label(ioscfg, text="留空 = 保持原样", style="Sub.TLabel").grid(row=3, column=2, sticky="w", padx=(6, 0))
 
-        ttk.Label(ioscfg, text="📉  最低系统:").grid(row=3, column=0, sticky="e", padx=(0, 6), pady=4)
+        ttk.Label(ioscfg, text="📉  最低系统:").grid(row=4, column=0, sticky="e", padx=(0, 6), pady=4)
         self.ios_min_os_var = tk.StringVar(value="13.0")
-        ttk.Entry(ioscfg, textvariable=self.ios_min_os_var, width=8).grid(row=3, column=1, sticky="w", pady=3)
+        ttk.Entry(ioscfg, textvariable=self.ios_min_os_var, width=8).grid(row=4, column=1, sticky="w", pady=3)
         ttk.Label(ioscfg, text="降包的 MinimumOSVersion (老设备装高版本标高的包); 留空 = 不降",
-                  style="Sub.TLabel").grid(row=3, column=2, sticky="w", padx=(6, 0))
+                  style="Sub.TLabel").grid(row=4, column=2, sticky="w", padx=(6, 0))
 
         devrow = ttk.Frame(left)
         self.devrow = devrow
@@ -647,12 +658,56 @@ class App:
         keys = getattr(self, "_device_keys", [])
         return keys[0] if keys else None
 
+    def refresh_ios_devices(self):
+        """iOS 设备下拉: devicectl + usbmuxd 双通道合并 (老设备 iOS<17 只有后者可见)。"""
+        if not IOS:
+            return
+        def work():
+            try:
+                return IOS.list_all_devices(), ""
+            except Exception as e:
+                return [], str(e)
+        def done():
+            devs, err = self._ios_devs
+            if err:
+                self.ios_device_lbl.config(text=f"刷新失败: {err}")
+                return
+            self._ios_dev_keys = devs
+            labels = [d[1] + ("" if d[2].lower().startswith("available")
+                              or d[2] == "available" or d[3] == "usbmuxd"
+                              else f" [{d[2]}]") for d in devs]
+            self.ios_device_box.config(values=labels)
+            if devs:
+                cur = self.ios_device_var.get()
+                if cur not in labels:
+                    self.ios_device_var.set(labels[0])
+                self.ios_device_lbl.config(text=f"{len(devs)} 台")
+            else:
+                self.ios_device_var.set("")
+                self.ios_device_lbl.config(text="未连接 (解锁亮屏重试)")
+        def work_done():
+            self._ios_devs = work()
+            done()
+        threading.Thread(target=work_done, daemon=True).start()
+
+    def _ios_device_key(self):
+        """下拉框 label -> 设备 UDID (按序对应)。"""
+        labels = self.ios_device_box.cget("values") or ()
+        cur = self.ios_device_var.get()
+        try:
+            idx = list(labels).index(cur)
+            return self._ios_dev_keys[idx][0] if idx < len(self._ios_dev_keys) else None
+        except (ValueError, AttributeError):
+            return None
+
     def _device_tool_key(self):
-        """设备工具窗口用的设备标识: 鸿蒙=connect key, iOS=UDID。"""
+        """设备工具窗口用的设备标识: iOS 优先下拉选中设备, 鸿蒙=connect key。"""
         if self.platform.get() == "ios":
-            udid = IOS.get_first_physical_udid() if IOS else None
+            udid = self._ios_device_key() if hasattr(self, "_ios_dev_keys") else None
             if not udid:
-                messagebox.showwarning("提示", "没有已连接的 iOS 设备 (devicectl 未发现可用物理设备)")
+                udid = IOS.get_first_physical_udid() if IOS else None
+            if not udid:
+                messagebox.showwarning("提示", "没有已连接的 iOS 设备 (解锁亮屏后点「🔄 刷新」)")
                 return None
             return udid
         return self._device_key()
@@ -695,6 +750,7 @@ class App:
             self.cfg_harmony.pack_forget()
             self.devrow.pack_forget()
             self.cfg_ios.pack(fill="x", pady=8)
+            self.refresh_ios_devices()
             self.refresh_ios_identities()
             self.refresh_ios_profiles()
         else:
@@ -1179,6 +1235,7 @@ class App:
                 "bundle": self.ios_bundle_var.get().strip() or None,
                 "min_os": self.ios_min_os_var.get().strip() or None,
                 "path": self.hap_path,
+                "device": self._ios_device_key(),
             }
             self._set_busy(True)
             threading.Thread(target=self._pipeline_ios, args=(install, snap), daemon=True).start()
@@ -1199,6 +1256,7 @@ class App:
                     "bundle": self.ios_bundle_var.get().strip() or None,
                     "min_os": self.ios_min_os_var.get().strip() or None,
                     "path": self.hap_path,
+                    "device": self._ios_device_key(),
                 }
             src = Path(snapshot["path"])
             identity = snapshot["identity"]
@@ -1254,7 +1312,7 @@ class App:
                 return
 
             self.log("3) 安装到设备")
-            IOS.install_to_device(out)
+            IOS.install_to_device(out, device_id=snapshot.get("device"))
             self.log("4) 完成 (设备上手动打开应用即可)")
             self.log("[+] iOS 流程完成")
         except Exception as e:
@@ -1489,7 +1547,7 @@ class App:
 class MirrorWindow:
     """设备投屏窗口: 截屏轮询。鸿蒙支持点击/滑动/按键回传; iOS 系统无输入注入, 只读。"""
 
-    POLL_MS = {"harmony": 500, "ios": 1000}
+    POLL_MS = {"harmony": 300, "ios": 300}
 
     def __init__(self, app, platform, device_key):
         self.app = app
@@ -1609,11 +1667,11 @@ class MirrorWindow:
             if err:
                 self.app.log(f"[!] 投屏抓帧失败: {err}")
         if self._running:
-            self.win.after(80, self._poll)
+            self.win.after(30, self._poll)
 
     def _make_display_frame(self):
-        """显示帧: sips 转磁盘临时文件。Tk 8.5 的 PhotoImage 只认 GIF/PGM/PPM
-        (PNG 需 Tk 8.6+), 统一转 GIF 双版本兼容; 同时按画布重采样防高分屏撑爆窗口。"""
+        """显示帧: sips 按画布重采样。Tk>=8.6 用 PNG (24bit 真彩, 清晰);
+        Tk 8.5 (PNG 不支持) 回退 GIF (256 色量化, 较模糊)。"""
         cw = max(self.canvas.winfo_width(), 200)
         ch = max(self.canvas.winfo_height(), 300)
         src = str(self._shot_png)
@@ -1625,15 +1683,23 @@ class MirrorWindow:
             self._src_wh = (w, h)
         except Exception:
             self._src_wh = None
-        disp = self._shot_png.parent / "disp.gif"
-        args = ["sips", "-s", "format", "gif"]
-        if self._src_wh:
-            scale = min(cw / w, ch / h, 1.0)
-            if scale < 0.98:
-                args += ["-z", str(max(1, int(h * scale))), str(max(1, int(w * scale)))]
-        args += [src, "--out", str(disp)]
+            w = h = 0
+        scale = min(cw / w, ch / h, 1.0) if w else 1.0
+        png_out = self._shot_png.parent / "disp.png"
+        gif_out = self._shot_png.parent / "disp.gif"
+        args = ["sips", "-s", "format", "png"]
+        if self._src_wh and scale < 0.98:
+            args += ["-Z", str(max(1, int(max(w, h) * scale)))]
+        args += [src, "--out", str(png_out)]
         subprocess.run(args, capture_output=True, timeout=10)
-        return disp if disp.exists() else src
+        if png_out.exists() and tk.TkVersion >= 8.6:
+            return str(png_out)
+        gif_args = ["sips", "-s", "format", "gif"]
+        if self._src_wh and scale < 0.98:
+            gif_args += ["-Z", str(max(1, int(max(w, h) * scale)))]
+        gif_args += [src, "--out", str(gif_out)]
+        subprocess.run(gif_args, capture_output=True, timeout=10)
+        return str(gif_out) if gif_out.exists() else src
 
     def _canvas_ratio(self, event):
         wh = getattr(self, "_img_wh", None)

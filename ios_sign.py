@@ -873,7 +873,8 @@ def list_devices():
 
 
 def get_first_physical_udid():
-    """返回第一台可用物理设备 UDID, 无则 None (投屏/日志窗口用)。"""
+    """返回第一台可用物理设备 UDID, 无则 None (投屏/日志窗口用)。
+    devicectl 可用设备优先, 其次 usbmuxd 老设备 (iOS<17)。"""
     try:
         for d in list_devices():
             if not d[3]:
@@ -883,7 +884,36 @@ def get_first_physical_udid():
                 return d[0]
     except Exception:
         pass
-    return None
+    legacy = _usbmux_legacy_devices()
+    return legacy[0][0] if legacy else None
+
+
+def list_all_devices():
+    """双通道合并设备列表 (GUI 设备下拉用):
+      [(id, 显示名, state, 通道)] 通道: 'devicectl' | 'usbmuxd'
+    usbmuxd 老设备 40 位 hex UDID 恒可装 (iOS<17 无 CoreDevice, devicectl 看不见);
+    devicectl 设备标 unavailable 时若同机在 usbmuxd 出现, 以 usbmuxd 条目为准。"""
+    out = []
+    seen_names = set()
+    legacy = _usbmux_legacy_devices()
+    legacy_hex = {u for u, _n, _v in legacy}
+    for u, name, ver in legacy:
+        label = f"{name} (iOS {ver}, 老设备)"
+        out.append((u, label, "available", "usbmuxd"))
+        seen_names.add(name)
+    try:
+        for d in list_devices():
+            if not d[3]:
+                continue
+            udid, name, state, _phys = d
+            if name in seen_names and not (state.lower().startswith("available")
+                                           or state.lower() == "connected"):
+                continue
+            out.append((udid, name, state, "devicectl"))
+            seen_names.add(name)
+    except Exception:
+        pass
+    return out
 
 
 def _unsigned_nested_bundles(ipa_path):
@@ -939,9 +969,13 @@ def _install_via_ios_deploy(ipa_path, device_udid=None, timeout=600):
 def install_to_device(ipa_path, device_id=None, timeout=300, identity=None):
     """安装 ipa 到设备. device_id 为空时选第一台可用的物理设备; 无可用时给出具体原因.
     identity 给出时, 检测到未签名嵌套 bundle 会自动重签后安装.
-    设备通道自动选择: iOS 17+ 走 devicectl; iOS<17 老设备 (devicectl 显示 unavailable
-    但 usbmuxd 可见) 自动回退 ios-deploy."""
+    双通道: device_id 是 40 位 hex (usbmuxd 老设备) -> ios-deploy 直装;
+    00008xxx CoreDevice UDID -> devicectl, 失败且 usbmuxd 有老设备时自动回退."""
     ipa_path = str(ipa_path)
+    legacy_mode = bool(device_id) and re.fullmatch(r"[0-9a-fA-F]{40}", device_id or "")
+    if legacy_mode:
+        print(f"[*] 老设备 (iOS<17) -> ios-deploy 通道: {device_id}")
+        return _install_via_ios_deploy(ipa_path, device_id, timeout=600)
     devs = list_devices()
     physical = [d for d in devs if d[3]]
     if device_id:

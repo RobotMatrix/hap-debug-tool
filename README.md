@@ -38,7 +38,9 @@ profile、重签名、校验）与 .ipa/.app 一致。
 
 `install` 双通道：iOS 17+ 走 `devicectl`；iOS<17 老设备（devicectl 显示
 unavailable 但 usbmuxd 可见）自动回退 `ios-deploy`（需 `brew install ios-deploy`）。
-两通道 UDID 异构（40 位 hex vs `00008xxx-xxx`），GUI/CLI 无需手动区分。
+两通道 UDID 异构（40 位 hex vs `00008xxx-xxx`）。GUI iOS 设置面板有设备下拉
+（双通道合并列表，可手动指定目标设备）；CLI `install -d <UDID>` 传 40 位 hex
+即直达 ios-deploy。
 
 GUI iOS 设置面板有「📉 最低系统版本」输入框（默认 13.0），与 CLI `--min-os`
 等价；老设备装高版本标高的包时无需降级脚本。
@@ -59,7 +61,7 @@ GUI iOS 设置面板有「📉 最低系统版本」输入框（默认 13.0）�
 
 | 能力 | 鸿蒙 | iOS |
 |---|---|---|
-| 投屏 | `snapshot_display`+`file recv` 轮询，点击/拖拽/按键回传 (`uitest uiInput`) | `devicectl capture screenshot` 轮询，**只读**（系统无输入注入） |
+| 投屏 | `snapshot_display`+`file recv` 轮询，点击/拖拽/按键回传 (`uitest uiInput`) | 双通道: iOS17+ `devicectl capture screenshot`; iOS<17 `idevicescreenshot`（快 3 倍）只读（系统无输入注入） |
 | 运行日志 | `hdc shell hilog` 流式 | `idevicesyslog`（需 `brew install libimobiledevice`） |
 | 崩溃日志 | `hidumper` 列表 + `file recv` 拉取 (jscrash/cppcrash) | `systemCrashLogs` 域整包拉取 (.ips) |
 

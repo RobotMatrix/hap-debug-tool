@@ -261,22 +261,57 @@ class HarmonyLogs:
 # ---------------------------------------------------------------- iOS (devicectl)
 
 class IOSScreen:
-    """iOS 截屏轮询: devicectl capture screenshot (原生 PNG, 无需 sips)。"""
+    """iOS 截屏轮询, 双通道:
+      - iOS<17 老设备 (40 位 hex UDID): idevicescreenshot (screenshotr, ~0.6s/帧)
+      - iOS 17+ (CoreDevice UDID): devicectl capture screenshot (~2s/帧, 原生 PNG)
+    两者输出均为 PNG; 输出统一 8-bit (idevicescreenshot 可能产 16-bit, tkinter
+    PhotoImage 不认), 经 sips 归一。"""
 
     def __init__(self, udid):
         self.udid = udid
+        self.legacy = bool(re.fullmatch(r"[0-9a-fA-F]{40}", udid))
         self._tmp = Path(tempfile.mkdtemp(prefix="hapdbg_mirror_ios_"))
 
     def grab(self, png_path):
         t0 = time.time()
-        rc, out, err = _run_capture(["xcrun", "devicectl", "device", "capture", "screenshot",
-                             "--device", self.udid, "--destination", str(png_path)], timeout=30)
-        if rc != 0 or not Path(png_path).exists():
-            return False, 0, (err.strip() or out.strip() or "截图失败")
+        if self.legacy:
+            if not shutil.which("idevicescreenshot"):
+                return False, 0, ("老设备投屏需要 libimobiledevice: brew install libimobiledevice")
+            rc, out, err = _run_capture(["idevicescreenshot", "-u", self.udid,
+                                         str(png_path)], timeout=15)
+            if rc != 0 or not Path(png_path).exists():
+                return False, 0, (err.strip() or out.strip() or "截图失败")
+            _normalize_png(png_path)
+        else:
+            rc, out, err = _run_capture(["xcrun", "devicectl", "device", "capture", "screenshot",
+                                         "--device", self.udid, "--destination", str(png_path)],
+                                        timeout=30)
+            if rc != 0 or not Path(png_path).exists():
+                return False, 0, (err.strip() or out.strip() or "截图失败")
         return True, int((time.time() - t0) * 1000), ""
 
     def cleanup(self):
         shutil.rmtree(self._tmp, ignore_errors=True)
+
+
+def _normalize_png(path):
+    """归一为 tkinter PhotoImage 可认的 8-bit PNG:
+    idevicescreenshot 产 16-bit PNG, sips 无法直接降位深 — 经 JPEG 中转再转回
+    PNG 得到 8-bit。已是 8-bit 则原样返回。"""
+    try:
+        with open(path, "rb") as f:
+            head = f.read(26)
+        if head[:4] == b"\x89PNG" and head[24] == 8:
+            return
+        tmp_j = str(path) + ".mid.jpg"
+        tmp_p = str(path) + ".norm.png"
+        rc1, _, _ = _run(["sips", "-s", "format", "jpeg", str(path), "--out", tmp_j], timeout=10)
+        rc2, _, _ = _run(["sips", "-s", "format", "png", tmp_j, "--out", tmp_p], timeout=10)
+        if rc1 == 0 and rc2 == 0 and Path(tmp_p).exists():
+            shutil.move(tmp_p, path)
+        Path(tmp_j).unlink(missing_ok=True)
+    except Exception:
+        pass
 
 
 class IOSLogs:

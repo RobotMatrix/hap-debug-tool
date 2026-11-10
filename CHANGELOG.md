@@ -2,6 +2,34 @@
 
 所有显著变更记录在本文件。格式参考 Keep a Changelog。
 
+## [Unreleased] - 2026-11-10 (6)
+
+### Fixed - 投屏清晰度/流畅度 + Added - iOS 多设备指定
+
+**iOS 多设备 (GUI/CLI)**:
+- `ios_sign.list_all_devices()`: devicectl + usbmuxd 双通道合并设备列表
+  (老设备标「iOS x.y, 老设备」, 40 位 hex UDID)
+- GUI iOS 设置面板新增「📱 设备」下拉 (含 🔄 刷新); `install_to_device` 按
+  UDID 形态自动路由: 40 位 hex → ios-deploy, CoreDevice → devicectl
+- `_device_tool_key` 投屏/日志窗口优先取下拉选中设备
+- 真机验证: 合并列表 5 台设备; 指定 iPhone 8 (iOS 13.5) ios-deploy 装包成功
+
+**iOS 投屏修复**:
+- 根因: 老设备 (iOS<17) devicectl 永远 unavailable → 投屏必失败
+- `IOSScreen` 双通道: 40 位 hex UDID 走 `idevicescreenshot` (screenshotr,
+  ~0.7s/帧, 比 devicectl 快 3 倍), iOS 17+ 仍走 devicectl
+- 16-bit PNG 归一 (idevicescreenshot 输出 16-bit, tkinter 不认): sips JPEG
+  中转降为 8-bit
+
+**鸿蒙投屏清晰度**:
+- 根因: 显示帧统一转 GIF (256 色量化), 渐变/细节丢失 → 模糊
+- 改为 Tk>=8.6 用 PNG 真彩 (16.7 万色), 仅 Tk 8.5 回退 GIF; 实测渲染分辨率/
+  帧率不变, 色彩全保留
+
+**投屏流畅度**:
+- poll 链间隔 500/1000ms → 300ms, 帧间等待 80ms → 30ms, 实测 1.4→1.5fps
+  且点击回传响应更快 (触摸命令与抓帧不再长时间排队)
+
 ## [Unreleased] - 2026-11-10 (5)
 
 ### Added - GUI iOS 签名支持「最低系统版本」+ Tk 线程安全修复

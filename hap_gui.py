@@ -717,8 +717,8 @@ class App:
             self.ios_prov_var.set("")
             return
         p = Path(src)
-        if p.suffix.lower() != ".ipa":
-            self.log(f"[-] 安装包 {p.name} 不是 .ipa, 无内嵌描述文件")
+        if p.suffix.lower() not in (".ipa", ".xcarchive"):
+            self.log(f"[-] 安装包 {p.name} 不是 .ipa / .xcarchive, 无内嵌描述文件")
             self.ios_prov_var.set("")
             return
         try:
@@ -859,8 +859,8 @@ class App:
         ios = self.platform.get() == "ios"
         if ios:
             p = filedialog.askopenfilename(
-                title="选择 ipa / app",
-                filetypes=[("iOS App", "*.ipa *.app"), ("All", "*.*")])
+                title="选择 ipa / app / xcarchive",
+                filetypes=[("iOS App", "*.ipa *.app *.xcarchive"), ("All", "*.*")])
         else:
             p = filedialog.askopenfilename(
                 title="选择 HAP / App Pack",
@@ -876,8 +876,8 @@ class App:
     def set_file(self, path):
         p = Path(path)
         suffix = p.suffix.lower()
-        if suffix == ".ipa" and self.platform.get() != "ios":
-            self.log("[*] 检测到 .ipa, 自动切换到 iOS 模式")
+        if suffix in (".ipa", ".xcarchive") and self.platform.get() != "ios":
+            self.log(f"[*] 检测到 {suffix}, 自动切换到 iOS 模式")
             self.platform.set("ios")
             self.on_platform_change()
         elif suffix in (".hap", ".hsp") and self.platform.get() == "ios":
@@ -915,15 +915,17 @@ class App:
 
     def set_file_ios(self, path):
         p = Path(path)
-        if p.suffix not in (".ipa", ".app"):
-            self.info.config(text=f"iOS 模式仅支持 .ipa / .app: {p.name}")
-            self.log(f"[-] iOS 模式仅支持 .ipa / .app, 收到 {p.name}")
+        if p.suffix.lower() not in (".ipa", ".app", ".xcarchive"):
+            self.info.config(text=f"iOS 模式仅支持 .ipa / .app / .xcarchive: {p.name}")
+            self.log(f"[-] iOS 模式仅支持 .ipa / .app / .xcarchive, 收到 {p.name}")
             return
         try:
             info = IOS.read_sign_info(p)
             bundle, ver = "", "?"
             tmp = None
-            if p.suffix == ".ipa":
+            if p.suffix.lower() == ".xcarchive":
+                app_dir = IOS.find_app_in_xcarchive(p)
+            elif p.suffix == ".ipa":
                 tmp = tempfile.TemporaryDirectory(prefix="iosgui_")
                 app_dir = IOS.extract_ipa(p, tmp.name, keep_signature=True)
             else:
@@ -1115,10 +1117,13 @@ class App:
 
             # profile 兼容性预检: 固定 bundle id 的 profile 与设备上已装的同名应用
             # (通配 entitlement) 会冲突, 报 MismatchedApplicationIdentifierEntitlement
-            if prov and src.suffix == ".ipa":
+            if prov and src.suffix.lower() in (".ipa", ".xcarchive"):
                 try:
                     with tempfile.TemporaryDirectory(prefix="iosgui_pre_") as _td:
-                        _app = IOS.extract_ipa(src, _td, keep_signature=True)
+                        if src.suffix.lower() == ".xcarchive":
+                            _app = IOS.find_app_in_xcarchive(src)
+                        else:
+                            _app = IOS.extract_ipa(src, _td, keep_signature=True)
                         pkg_bid = IOS.read_bundle_id(_app)
                     prov_appid = (IOS.read_mobileprovision(prov).get("Entitlements") or {}) \
                         .get("application-identifier", "")

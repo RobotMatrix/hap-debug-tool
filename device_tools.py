@@ -14,12 +14,17 @@ device_tools.py -- 设备投屏/日志抓取 (鸿蒙 hdc + iOS devicectl/idevice
 """
 
 import hashlib
+import json
 import os
 import re
 import shutil
 import signal
+import socket
+import struct
 import subprocess
+import sys
 import tempfile
+import threading
 import time
 from pathlib import Path
 
@@ -192,24 +197,34 @@ def _run_out(rc, err):
     return err or ("" if rc == 0 else "fail")
 
 
+def _ver_cmp(a, b):
+    """数值化版本比较 "5.0.1.2" vs "6.0.2.1" → -1/0/1 (按点分段比)。"""
+    pa = [int(x) for x in a.split(".")]
+    pb = [int(x) for x in b.split(".")]
+    for x, y in zip(pa, pb):
+        if x != y:
+            return -1 if x < y else 1
+    return 0
+
+
 class HarmonyScreenStream:
-    """鸿蒙准视频流 (双缓冲): 设备端常驻 shell 循环 snapshot 到 db_0/db_1 两个
-    文件交替写入, host 高频轮询 recv 两个缓冲 + md5 去重后渲染。
-    实测 Mate 60: 4.4 fps (旧串行链 2.0 fps 的 2.2 倍); 输入回传 (uitest) 与
-    抓帧 shell 是不同 hdc 会话, 点击时画面不冻结。
-    snapshot_display 本身 ~300ms 是设备端 SurfaceFlinger 快照固定成本, 纯
-    shell 无 agent 的帧率上限即此; 真 H.264 流需设备端 agent (如 HoKit)。"""
+    """鸿蒙准视频流 (并发双循环): 两个独立 hdc shell 会话各自循环 snapshot 到
+    独立文件 (SurfaceFlinger 快照可并行), host 高频轮询 recv 两缓冲 + md5 去重。
+    实测 Mate 60 动态画面 5.1 fps (旧串行 0.2 fps 的 ~25 倍, 单循环流式 1.7 的 3 倍);
+    输入回传 (uitest) 独立会话, 点击时画面不冻结。
+    三循环实测 4.9fps 收益递减且加重设备负载, 双循环即 shell 通道天花板。
+    snapshot_display ~300ms 是设备端 SurfaceFlinger 快照固定成本, 真 H.264
+    视频流需设备端 agent (如 HoKit 推服务 hap)。"""
 
     REMOTE_FMT = "/data/local/tmp/hapdbg_stream_{i}.jpeg"
-    N_BUF = 2
+    N_STREAMS = 2
 
     def __init__(self, hdc_bin, connect_key=None):
         self.bin = hdc_bin
         self.key = connect_key
-        self.proc = None          # 设备端常驻循环 shell 进程
+        self.procs = []           # 设备端并发抓帧 shell 进程
         self._last_md5 = None
         self._new_frames = 0
-        self._cur = 0
         self._tmp = Path(tempfile.mkdtemp(prefix="hapdbg_stream_"))
         self.jpeg_path = self._tmp / "frame.jpeg"
         self.png_path = self._tmp / "frame.png"
@@ -218,60 +233,436 @@ class HarmonyScreenStream:
         return [self.bin] + (["-t", self.key] if self.key else [])
 
     def start(self):
-        """启动设备端常驻双缓冲抓帧循环 (单个 hdc shell 进程)。"""
-        if self.proc and self.proc.poll() is None:
+        """启动 N_STREAMS 个并发设备端抓帧循环 (各自独立 hdc shell 会话)。"""
+        if self.procs and any(p.poll() is None for p in self.procs):
             return
-        remotes = " ".join(self.REMOTE_FMT.format(i=i) for i in range(self.N_BUF))
-        script = ("for i in $(seq 1 100000); do f=$((i % 2)); "
-                  f"snapshot_display -f {self.REMOTE_FMT.format(i='$f')} >/dev/null 2>&1; done")
-        self.proc = subprocess.Popen(self._base() + ["shell", script],
-                                     stdout=subprocess.DEVNULL,
-                                     stderr=subprocess.DEVNULL,
-                                     start_new_session=True)
+        for i in range(self.N_STREAMS):
+            remote = self.REMOTE_FMT.format(i=i)
+            script = (f"while true; do snapshot_display -f {remote} >/dev/null 2>&1; done")
+            p = subprocess.Popen(self._base() + ["shell", script],
+                                 stdout=subprocess.DEVNULL,
+                                 stderr=subprocess.DEVNULL,
+                                 start_new_session=True)
+            self.procs.append(p)
+
+    def _recv_buf(self, i):
+        """recv 单个缓冲 (线程池并行用)。返回 (local, md5) 或 (None, "")。"""
+        local = self._tmp / f"buf_{i}.jpeg"
+        rc, _, _e = _run_capture(self._base() + ["file", "recv",
+                                  self.REMOTE_FMT.format(i=i), str(local)], timeout=8)
+        if rc != 0 or not local.exists() or local.stat().st_size == 0:
+            # snapshot 正在覆写的瞬间 recv 会拿到空/半文件, 属正常竞态, 静默跳过
+            return None, ""
+        return local, hashlib.md5(local.read_bytes()).hexdigest()
 
     def grab(self, out_png=None):
-        """轮询两个缓冲, 收到新帧 (md5 变化) 时转换 PNG。返回 (new_frame, ms, err)。
-        recv ~45ms/次, 两缓冲 ~90ms 一轮, 不到 snapshot 300ms 的三分之一。"""
+        """并行 recv 两缓冲 (各一线程, 44ms 一轮而非串行 90ms), md5 去重后转 PNG。
+        返回 (new_frame, ms, err)。"""
         t0 = time.time()
         is_new = False
-        err = ""
-        for i in range(self.N_BUF):
-            remote = self.REMOTE_FMT.format(i=i)
-            local = self._tmp / f"buf_{i}.jpeg"
-            rc, _, e = _run_capture(self._base() + ["file", "recv", remote, str(local)],
-                                    timeout=8)
-            if rc != 0 or not local.exists() or local.stat().st_size == 0:
-                # snapshot 正在覆写的瞬间 recv 会拿到空/半文件, 属正常竞态, 静默跳过
+        new_local = None
+        results = [None] * self.N_STREAMS
+        threads = []
+        for i in range(self.N_STREAMS):
+            th = threading.Thread(target=lambda idx=i: results.__setitem__(
+                idx, self._recv_buf(idx)), daemon=True)
+            th.start()
+            threads.append(th)
+        for th in threads:
+            th.join()
+        for local, md5 in results:
+            if not local:
                 continue
-            md5 = hashlib.md5(local.read_bytes()).hexdigest()
             if md5 != self._last_md5:
                 is_new = True
-                if out_png:
-                    shutil.copy2(local, self.jpeg_path)
+                new_local = local
                 self._last_md5 = md5
         if is_new:
             self._new_frames += 1
-            if out_png:
+            if out_png and new_local:
+                shutil.copy2(new_local, self.jpeg_path)
                 rc2, _, e2 = _run_capture(["sips", "-s", "format", "png",
                                            str(self.jpeg_path), "--out", str(out_png)],
                                           timeout=10)
                 if rc2 != 0:
                     return False, 0, f"sips 失败: {(e2 or '').strip()}"
-        return is_new, int((time.time() - t0) * 1000), err
+        return is_new, int((time.time() - t0) * 1000), ""
 
     def stop(self):
-        """停止设备端循环 + 清理远端文件。"""
-        if self.proc and self.proc.poll() is None:
-            try:
-                os.killpg(self.proc.pid, signal.SIGKILL)
-            except Exception:
-                self.proc.kill()
-            self.proc = None
-        remotes = " ".join(self.REMOTE_FMT.format(i=i) for i in range(self.N_BUF))
+        """停止并发循环 + 清理远端文件。"""
+        for p in self.procs:
+            if p.poll() is None:
+                try:
+                    os.killpg(p.pid, signal.SIGKILL)
+                except Exception:
+                    p.kill()
+        self.procs = []
+        remotes = " ".join(self.REMOTE_FMT.format(i=i) for i in range(self.N_STREAMS))
         _run(self._base() + ["shell", "rm", "-f", remotes], timeout=10)
 
     def cleanup(self):
         self.stop()
+        shutil.rmtree(self._tmp, ignore_errors=True)
+
+
+class HarmonyVideoStream:
+    """鸿蒙真视频流 (Hypium agent 协议, DevEco screen-mirroring 同款):
+      1. 查设备 uitest 版本 → 选配套 uitest_agent*.so → push 到
+         /data/local/tmp/agent.so (映射反编译自 hosScrcpy 插件:
+         ≤5.1.1.2→1.1.3, ==5.1.1.3→1.1.5, ≤6.0.2.1→1.1.12, 更新→1.2.3;
+         不匹配会被 daemon EXTENSION_API_CHECK 拒载, RPC 直接被 reset)
+         agent 优先从本机 DevEco 插件 jar 提取, 回退仓库 tools/agent/ 内置
+      2. shell: uitest start-daemon singleness --extension-name agent.so 加载
+         (agent 以 shell uid 调 DisplayManager::GetScreenshot → JPEG, 无需
+          CAPTURE_SCREEN 系统权限; 注意 killall 对它无效, 须 pgrep+kill -9)
+      3. hdc fport tcp:<local> tcp:8012 (agent RPC 端口)
+      4. RPC: HEAD + 4B sessionId + 4B bodyLen + JSON body + TAIL
+         {module: hypiumApiHelper, method: Captures,
+          params: {api: startCaptureScreen, args: {options: {scale}}}}
+      5. 服务端先回 {"result":true} ack, 之后画面变化时推 JPEG 帧 (socket
+         直读 SOI/EOI 切帧); 静止时静默 (recv 超时≠故障, 查 daemon 存活定性)。
+      输入注入走同一 socket 的 Gestures RPC (touchDown/Move/Up) — uitest CLI
+      会话会把录屏会话顶掉, 故仅按键走 CLI 且完成后同 socket 重发
+      startCaptureScreen 自愈。
+    实测 Mate 60 (uitest 5.0.1.2): 通知栏动画 7.9fps, 静止 4.9fps (状态栏
+    跳变帧), 断线重连 2.8s; scale 0.5 时帧 ~22KB。"""
+
+    HEAD = b"_uitestkit_rpc_message_head_"
+    TAIL = b"_uitestkit_rpc_message_tail_"
+    DEVICE_AGENT = "/data/local/tmp/agent.so"
+    DEVICE_PORT = 8012
+    MODULE = "com.ohos.devicetest.hypiumApiHelper"
+    JPEG_SOI = b"\xff\xd8\xff"
+    JPEG_EOI = b"\xff\xd9"
+    POLL_HINT_MS = 40          # GUI 轮询间隔 (帧持续到达, 无需像 snapshot 那样等)
+    RESTART_COOLDOWN = 5       # 重连冷却 (秒), 防息屏期间连环重启轰炸设备
+    # (uitest 版本上限, agent 文件名); 顺序敏感, 依次匹配; None = 兜底最新
+    AGENT_RULES = (("5.1.1.2", "uitest_agent_1.1.3.so"),
+                   ("5.1.1.3", "uitest_agent_1.1.5.so"),
+                   ("6.0.2.1", "uitest_agent_1.1.12.so"),
+                   (None, "uitest_agent_1.2.3.so"))
+
+    def __init__(self, hdc_bin, connect_key=None, scale=0.5, screen_wh=(1216, 2688)):
+        self.bin = hdc_bin
+        self.connect_key = connect_key   # 不叫 self.key: 会让 key() 输入方法失效
+        self.scale = scale
+        self.w, self.h = screen_wh
+        self.sock = None
+        self.fport_port = None
+        self._session = 1
+        self._buf = b""
+        self._proc = None
+        self._proc_log = None
+        self._tmp = Path(tempfile.mkdtemp(prefix="hapdbg_video_"))
+        self._last_md5 = None
+        self._last_ok = 0.0
+        self._restart_at = 0.0
+        self._restart_lock = threading.Lock()
+        self._send_lock = threading.Lock()
+
+    def _base(self):
+        return [self.bin] + (["-t", self.connect_key] if self.connect_key else [])
+
+    # ---- agent 版本匹配 + 定位 ----
+    @classmethod
+    def _pick_agent_name(cls, uitest_ver):
+        """按设备 uitest 版本选 agent (DevEco hosScrcpy 同款映射)。"""
+        if not uitest_ver:
+            return cls.AGENT_RULES[-2][1]     # 版本未知 → 中间档 (适配面最宽)
+        for cap, name in cls.AGENT_RULES:
+            if cap is None or _ver_cmp(uitest_ver, cap) <= 0:
+                return name
+        return cls.AGENT_RULES[-1][1]
+
+    def _uitest_version(self):
+        rc, out, _ = _run_capture(self._base() + ["shell",
+                                                  "/system/bin/uitest --version"],
+                                  timeout=15)
+        m = re.search(r"(\d+)\.(\d+)\.(\d+)", (out or "").strip().splitlines()[-1]
+                      if (out or "").strip() else "")
+        return m.group(0) if m else None
+
+    @staticmethod
+    def _find_agent_so(name):
+        """按名字找 agent: DevEco 插件 jar 提取 → 仓库 tools/agent/。"""
+        import zipfile
+        jars = []
+        for pat in ("DevEco-Studio*/Contents/plugins/screen-mirroring/lib/"
+                    "hosScrcpy-*.jar",
+                    "DevEco Studio*/Contents/plugins/*/lib/hosScrcpy-*.jar"):
+            jars += list(Path("/Applications").glob(pat))
+        cache = Path.home() / "Library/Caches/hap_installer/agent"
+        for jar in sorted(set(jars), reverse=True):
+            try:
+                with zipfile.ZipFile(jar) as z:
+                    if name in z.namelist():
+                        cache.mkdir(parents=True, exist_ok=True)
+                        z.extract(name, cache)
+                        return cache / name
+            except Exception:
+                continue
+        # 仓库内置 (含 PyInstaller 打包 _MEIPASS)
+        for base in (Path(getattr(sys, "_MEIPASS", "") or ".") / "tools" / "agent",
+                     Path(__file__).resolve().parent / "tools" / "agent"):
+            p = base / name
+            if p.exists():
+                return p
+        return None
+
+    def start(self):
+        """推送 agent → 起 daemon → fport → 建 RPC socket。
+        daemon 用分离进程拉起 (前台驻留型, 若走 _run_capture 超时 killpg 会误杀);
+        旧实例清理用 pgrep+kill -9 (killall 对 uitest 会 Permission denied);
+        bind 失败 (垂死实例占 socket) 时轮询等待释放。"""
+        ver = self._uitest_version()
+        name = self._pick_agent_name(ver)
+        agent = self._find_agent_so(name)
+        if not agent:
+            raise RuntimeError(
+                f"设备 uitest {ver or '?'} 需 {name}, 本机 DevEco 与仓库 tools/agent/"
+                " 均未找到 (装 DevEco Studio 或把该 .so 放入 tools/agent/)")
+        rc, _, err = _run_capture(self._base() + ["file", "send", str(agent),
+                                                  self.DEVICE_AGENT], timeout=60)
+        if rc != 0:
+            raise RuntimeError(f"推送 agent 失败: {(err or '').strip()}")
+        _run(self._base() + ["shell",
+                             "for p in $(pgrep uitest); do kill -9 $p; done"],
+             timeout=10)
+        time.sleep(1)
+        log_path = self._tmp / "daemon.log"
+        self._proc_log = open(log_path, "wb")
+        self._proc = subprocess.Popen(
+            self._base() + ["shell", "/system/bin/uitest start-daemon singleness "
+                            "--extension-name agent.so"],
+            stdout=self._proc_log, stderr=subprocess.STDOUT,
+            start_new_session=True)
+        for _ in range(12):          # 等 daemon bind (垂死实例占 socket 时秒级释放)
+            if self._daemon_alive():
+                break
+            time.sleep(0.5)
+        else:
+            tail = log_path.read_text(errors="replace").strip()[-300:] \
+                if log_path.exists() else ""
+            raise RuntimeError(f"uitest daemon 未起来: {tail or '无输出'}")
+        self._alloc_fport()
+        self._connect()
+
+    def _connect(self):
+        """建 RPC 会话并发起录屏。daemon 是先 bind 8012 再 dlopen agent, 连早了
+        会被 RST — 发起后等 {"result":true} ack, 没等到就重试。"""
+        last_err = None
+        for _ in range(4):
+            try:
+                self.sock = socket.create_connection(
+                    ("127.0.0.1", self.fport_port), timeout=6)
+                self.sock.settimeout(4)
+                self._buf = b""
+                self._send({"module": self.MODULE, "method": "Captures",
+                            "params": {"api": "startCaptureScreen",
+                                       "args": {"options": {"scale": self.scale}}}})
+                # 等 ack (json + 换行, 之后帧流开始); RST/超时 = daemon 还没就绪
+                ack = b""
+                while b"\n" not in ack:
+                    chunk = self.sock.recv(4096)
+                    if not chunk:
+                        raise ConnectionError("agent 关闭连接 (未就绪或版本不符)")
+                    ack += chunk
+                if b'"result":true' not in ack:
+                    raise ConnectionError(f"ack 异常: {ack[:120]!r}")
+                self._buf = ack[ack.index(b"\n") + 1:]
+                self.sock.settimeout(10)
+                self._last_md5 = None
+                return
+            except (OSError, ConnectionError) as e:
+                last_err = e
+                try:
+                    if self.sock:
+                        self.sock.close()
+                except Exception:
+                    pass
+                self.sock = None
+                time.sleep(1)
+        raise RuntimeError(f"RPC 会话建立失败: {last_err}")
+
+    def _send(self, req):
+        """封帧发送 (grab 线程并发 recv 不冲突, 发送侧加锁串行)。"""
+        body = json.dumps(req).encode()
+        with self._send_lock:
+            self.sock.sendall(self.HEAD + struct.pack(">ii", self._session, len(body))
+                              + body + self.TAIL)
+            self._session += 1
+
+    # ---- 输入注入 (同 socket RPC, 不挤占录屏会话; uitest CLI 会话会顶掉录屏) ----
+    def _rpc_gesture(self, api, x, y):
+        if not self.sock:
+            return
+        try:
+            self._send({"module": self.MODULE, "method": "Gestures",
+                        "params": {"api": api, "args": {"x": int(x), "y": int(y)}}})
+        except OSError:
+            pass
+
+    def click(self, x_ratio, y_ratio):
+        x, y = x_ratio * self.w, y_ratio * self.h
+        self._rpc_gesture("touchDown", x, y)
+        time.sleep(0.06)
+        self._rpc_gesture("touchUp", x, y)
+
+    def double_click(self, x_ratio, y_ratio):
+        self.click(x_ratio, y_ratio)
+        time.sleep(0.08)
+        self.click(x_ratio, y_ratio)
+
+    def swipe(self, x0r, y0r, x1r, y1r):
+        """8 步插值滑动 (touchDown → touchMove* → touchUp), 模拟真实轨迹。"""
+        x0, y0 = x0r * self.w, y0r * self.h
+        x1, y1 = x1r * self.w, y1r * self.h
+        self._rpc_gesture("touchDown", x0, y0)
+        for i in range(1, 9):
+            t = i / 8
+            self._rpc_gesture("touchMove", x0 + (x1 - x0) * t, y0 + (y1 - y0) * t)
+            time.sleep(0.016)
+        self._rpc_gesture("touchUp", x1, y1)
+
+    def key(self, name):
+        """按键无 Gestures 通道, 走 uitest CLI — 其会话会顶掉录屏, 完成后同
+        socket 重发 startCaptureScreen 自愈 (socket 不断, 只需重新拉起推流)。"""
+        mapping = {"back": "Back", "home": "Home", "power": "Power"}
+        _run(self._base() + ["shell", "uitest", "uiInput", "keyEvent",
+                             mapping.get(name, name)], timeout=10)
+        self._kick_capture()
+
+    def _kick_capture(self):
+        if not self.sock:
+            return
+        try:
+            self._send({"module": self.MODULE, "method": "Captures",
+                        "params": {"api": "startCaptureScreen",
+                                   "args": {"options": {"scale": self.scale}}}})
+        except OSError:
+            pass
+
+    def grab(self, out_path=None):
+        """收一帧 JPEG (socket 直读, SOI/EOI 切帧)。out_path=JPG 保存路径。
+        返回 (new_frame, ms, err)。画面变化才推帧 (状态栏秒级跳变也会推);
+        静止/静默不算错误, 返回 (False, ms, "") 与轮询通道"无新帧"语义一致。"""
+        t0 = time.time()
+        if self.sock is None:
+            return False, 0, "未连接"
+        deadline = time.time() + 6
+        dups = 0
+        while time.time() < deadline:
+            i = self._buf.find(self.JPEG_SOI)
+            j = self._buf.find(self.JPEG_EOI, i + 2) if i >= 0 else -1
+            if i >= 0 and j >= 0:
+                frame = self._buf[i:j + 2]
+                self._buf = self._buf[j + 2:]
+                md5 = hashlib.md5(frame).hexdigest()
+                if md5 == self._last_md5:
+                    dups += 1
+                    continue  # 重复帧, 继续收
+                self._last_md5 = md5
+                self._last_ok = time.time()
+                if out_path:
+                    Path(out_path).write_bytes(frame)
+                return True, int((time.time() - t0) * 1000), ""
+            try:
+                chunk = self.sock.recv(1048576)
+            except socket.timeout:
+                # 静止画面 agent 静默不推帧: daemon 还活着就不算故障, 不触发重连
+                if self._daemon_alive():
+                    return False, int((time.time() - t0) * 1000), ""
+                return False, 0, "recv 超时且 daemon 已退出"
+            except (ConnectionResetError, BrokenPipeError, OSError):
+                return False, 0, "连接断开"
+            if not chunk:
+                return False, 0, "连接关闭"
+            self._buf += chunk
+        if dups:
+            return False, int((time.time() - t0) * 1000), ""
+        # 完全静止时 agent 静默 (无重复帧也无新帧): daemon 活着就不算故障
+        if self._daemon_alive():
+            return False, int((time.time() - t0) * 1000), ""
+        return False, 0, "6s 无完整帧且 daemon 已退出"
+
+    def _daemon_alive(self):
+        rc, out, _ = _run_capture(self._base() + ["shell",
+            "ps -ef | grep 'singleness' | grep -v grep"], timeout=15)
+        return bool((out or "").strip())
+
+    def restart_session(self):
+        """断线重连: agent 会话随连接断开而终止 (Auto stop copyScreen since
+        session dead), 且 daemon 空闲 3 分钟自杀。整链重启 (daemon 活着时
+        杀掉重来最可靠), fport 规则一并重建。冷却 + 近期有成功帧即跳过,
+        防止息屏期间连环重启轰炸设备。"""
+        with self._restart_lock:
+            wait = self._restart_at - time.time()
+            if wait > 0:
+                time.sleep(wait)
+            if self.sock is not None and time.time() - self._last_ok < 15:
+                return  # 另一次重连已成功, 无需再来
+            self._restart_at = time.time() + self.RESTART_COOLDOWN
+            try:
+                if self.sock:
+                    self.sock.close()
+            except Exception:
+                pass
+            self.sock = None
+            if self.fport_port:
+                _run(self._base() + ["fport", "rm", f"tcp:{self.fport_port}",
+                                 f"tcp:{self.DEVICE_PORT}"], timeout=10)
+                self.fport_port = None
+            self.start()
+
+    def _alloc_fport(self):
+        local = 18212
+        for attempt in range(6):
+            for port in range(local, local + 30):
+                rc, out, _ = _run_capture(self._base() + ["fport", f"tcp:{port}",
+                                                          f"tcp:{self.DEVICE_PORT}"], timeout=15)
+                if rc == 0 and "OK" in (out or ""):
+                    self.fport_port = port
+                    return
+            # 全部端口占用: 可能 fport 规则残留, 清掉本工具端口段重试
+            for port in range(local, local + 30):
+                _run(self._base() + ["fport", "rm", f"tcp:{port}",
+                                      f"tcp:{self.DEVICE_PORT}"], timeout=10)
+            time.sleep(1.5)
+        raise RuntimeError("fport 建立失败 (设备 8012 转发不可用)")
+
+    def stop(self):
+        try:
+            if self.sock:
+                stop_req = {"module": self.MODULE, "method": "Captures",
+                            "params": {"api": "stopCaptureScreen", "args": {}}}
+                body = json.dumps(stop_req).encode()
+                self.sock.sendall(self.HEAD + struct.pack(">ii", self._session, len(body))
+                                  + body + self.TAIL)
+                self.sock.close()
+        except Exception:
+            pass
+        self.sock = None
+        if self._proc and self._proc.poll() is None:
+            try:
+                os.killpg(self._proc.pid, signal.SIGKILL)
+            except Exception:
+                self._proc.kill()
+        self._proc = None
+        if self._proc_log:
+            try:
+                self._proc_log.close()
+            except Exception:
+                pass
+            self._proc_log = None
+
+    def cleanup(self):
+        self.stop()
+        if self.fport_port:
+            _run(self._base() + ["fport", "rm", f"tcp:{self.fport_port}",
+                                 f"tcp:{self.DEVICE_PORT}"], timeout=10)
+            self.fport_port = None
+        # daemon 交给空闲自杀 (3 分钟); killall 会误伤 DevEco 等其他 uitest 会话
+        _run(self._base() + ["shell", "rm", "-f", self.DEVICE_AGENT], timeout=10)
         shutil.rmtree(self._tmp, ignore_errors=True)
 
 

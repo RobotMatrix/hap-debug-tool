@@ -12,6 +12,7 @@ packaging/tools/
 # 构建产物
 packaging/dist/
 packaging/build/
+packaging/version.txt
 *.spec
 *.dmg
 rw.*.dmg

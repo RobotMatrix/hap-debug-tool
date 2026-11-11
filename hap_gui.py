@@ -1603,11 +1603,26 @@ class MirrorWindow:
         try:
             if self.platform == "harmony":
                 hdc_bin = H.Tools().tool("hdc")
-                # 流式: 设备端常驻循环抓帧, host 高频 recv (帧率 2x, 输入不卡帧)
-                self.capture = DT.HarmonyScreenStream(hdc_bin, self.device_key)
-                self.capture.start()
                 wh = self._probe_harmony_wh()
-                self.input = DT.HarmonyInput(hdc_bin, self.device_key, screen_wh=wh)
+                try:
+                    # 视频流 (Hypium agent, DevEco 同款): 帧率远超 snapshot 轮询;
+                    # 输入走同 socket RPC (uitest CLI 会话会顶掉录屏流)
+                    self.capture = DT.HarmonyVideoStream(hdc_bin, self.device_key,
+                                                         screen_wh=wh)
+                    self.capture.start()
+                    self.input = self.capture
+                    self.app.log("[+] 投屏: Hypium agent 视频流")
+                except Exception as e:
+                    # 无 DevEco/agent 推送失败等 → 回退 snapshot 双循环轮询
+                    self.app.log(f"[-] 视频流不可用: {e}")
+                    self.app.log("[-] 回退 snapshot 轮询模式")
+                    try:
+                        self.capture.cleanup()  # 清掉可能已推送的 agent/fport
+                    except Exception:
+                        pass
+                    self.capture = DT.HarmonyScreenStream(hdc_bin, self.device_key)
+                    self.capture.start()
+                    self.input = DT.HarmonyInput(hdc_bin, self.device_key, screen_wh=wh)
             else:
                 self.capture = DT.IOSScreen(self.device_key)
         except Exception as e:
@@ -1632,7 +1647,10 @@ class MirrorWindow:
             ok, ms, err = self.capture.grab(self._shot_png)
             self._frame_q.put((ok, ms, err))
         threading.Thread(target=work, daemon=True).start()
-        self.win.after(self.POLL_MS.get(self.platform, 800), self._drain_frame)
+        # 视频流自带 POLL_HINT_MS (帧持续到达, 高频 drain); 其余按平台间隔
+        ms = getattr(self.capture, "POLL_HINT_MS", None) \
+            or self.POLL_MS.get(self.platform, 800)
+        self.win.after(ms, self._drain_frame)
 
     def _drain_frame(self):
         if not self._running:
@@ -1665,8 +1683,13 @@ class MirrorWindow:
             except Exception as e:
                 self.canvas.config(text=f"渲染失败: {e}")
         elif err:
-            self.lbl_status.config(text="● 抓帧失败", foreground=self.app.C["error"])
-            self.app.log(f"[!] 投屏抓帧失败: {err}")
+            self.lbl_status.config(text="● 重连中", foreground=self.app.C["accent"])
+            if hasattr(self.capture, "restart_session"):
+                # 视频流: 断线整链重连 (带冷却, 静止画面不会走到这)
+                threading.Thread(target=self.capture.restart_session, daemon=True).start()
+            else:
+                self.lbl_status.config(text="● 抓帧失败", foreground=self.app.C["error"])
+                self.app.log(f"[!] 投屏抓帧失败: {err}")
         # False 且无 err = 静止画面去重轮次, 状态不变
         if self._running:
             self.win.after(30, self._poll)

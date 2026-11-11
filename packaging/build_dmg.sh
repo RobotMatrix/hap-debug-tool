@@ -24,6 +24,11 @@ else
   chmod +x "$TOOLS/hdc" "$TOOLS/signer" 2>/dev/null || true
 fi
 
+# 投屏视频流 uitest agent (按设备 uitest 版本选配): 仓库 tools/agent/ → 打包
+mkdir -p "$TOOLS/agent"
+cp -f "$ROOT/tools/agent/"*.so "$TOOLS/agent/" 2>/dev/null \
+  || echo "   (缺视频流 agent .so, 投屏回退 snapshot 轮询)"
+
 echo ">> [2/4] 安装 PyInstaller"
 "$PY" -m pip install -q pyinstaller certifi 2>&1 | tail -1
 

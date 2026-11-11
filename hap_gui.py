@@ -1575,6 +1575,16 @@ class MirrorWindow:
         self.lbl_status.pack(side="left")
         self.lbl_fps = ttk.Label(bar, text="—", style="Sub.TLabel")
         self.lbl_fps.pack(side="left", padx=(10, 0))
+        if platform == "harmony":
+            # 清晰度 (仅视频流模式可见; 档位定义在 DT.HarmonyVideoStream)
+            self._quality_var = tk.StringVar(value=DT.HarmonyVideoStream.SCALE_OPTIONS[0][0])
+            self._quality_cb = ttk.Combobox(bar, textvariable=self._quality_var,
+                                            width=4, state="readonly",
+                                            values=[n for n, _ in
+                                                    DT.HarmonyVideoStream.SCALE_OPTIONS])
+            self._quality_cb.pack(side="left", padx=(10, 0))
+            self._quality_cb.bind("<<ComboboxSelected>>",
+                                  lambda e: self._on_quality_change())
         ttk.Button(bar, text="⌨️ Home", command=lambda: self.send_key("home")).pack(side="right")
         ttk.Button(bar, text="⬅️ 返回", command=lambda: self.send_key("back")).pack(side="right", padx=(0, 4))
 
@@ -1623,6 +1633,8 @@ class MirrorWindow:
                     self.capture = DT.HarmonyScreenStream(hdc_bin, self.device_key)
                     self.capture.start()
                     self.input = DT.HarmonyInput(hdc_bin, self.device_key, screen_wh=wh)
+                    if hasattr(self, "_quality_cb"):   # 轮询模式无档位可切
+                        self._quality_cb.pack_forget()
             else:
                 self.capture = DT.IOSScreen(self.device_key)
         except Exception as e:
@@ -1778,6 +1790,15 @@ class MirrorWindow:
                 self.app.log("[!] iOS 投屏只读, 无法发送按键 (系统无输入注入)")
             return
         threading.Thread(target=lambda: self.input.key(name), daemon=True).start()
+
+    def _on_quality_change(self):
+        """清晰度切换: 同 socket 重发捕获 (不动 daemon, 不断流)。"""
+        c = getattr(self, "capture", None)
+        if not c or not hasattr(c, "set_scale"):
+            return
+        scale = dict(DT.HarmonyVideoStream.SCALE_OPTIONS).get(self._quality_var.get())
+        if scale:
+            threading.Thread(target=c.set_scale, args=(scale,), daemon=True).start()
 
     def save_screenshot(self):
         src = self._shot_png

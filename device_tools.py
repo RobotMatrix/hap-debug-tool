@@ -336,13 +336,16 @@ class HarmonyVideoStream:
     JPEG_EOI = b"\xff\xd9"
     POLL_HINT_MS = 40          # GUI 轮询间隔 (帧持续到达, 无需像 snapshot 那样等)
     RESTART_COOLDOWN = 5       # 重连冷却 (秒), 防息屏期间连环重启轰炸设备
+    # 清晰度档位 (实测宽度按设备端枚举吸附: 0.5→608 / 0.75→928 / 0.9→1120;
+    # scale=1.0 反而回落 1056 且不稳定, 不设该档)
+    SCALE_OPTIONS = (("超清", 0.9), ("高清", 0.75), ("流畅", 0.5))
     # (uitest 版本上限, agent 文件名); 顺序敏感, 依次匹配; None = 兜底最新
     AGENT_RULES = (("5.1.1.2", "uitest_agent_1.1.3.so"),
                    ("5.1.1.3", "uitest_agent_1.1.5.so"),
                    ("6.0.2.1", "uitest_agent_1.1.12.so"),
                    (None, "uitest_agent_1.2.3.so"))
 
-    def __init__(self, hdc_bin, connect_key=None, scale=0.5, screen_wh=(1216, 2688)):
+    def __init__(self, hdc_bin, connect_key=None, scale=0.9, screen_wh=(1216, 2688)):
         self.bin = hdc_bin
         self.connect_key = connect_key   # 不叫 self.key: 会让 key() 输入方法失效
         self.scale = scale
@@ -359,6 +362,8 @@ class HarmonyVideoStream:
         self._restart_at = 0.0
         self._restart_lock = threading.Lock()
         self._send_lock = threading.Lock()
+        self._last_wh = None      # 最近一帧 (宽, 高), 清晰度切换时用于跳旧档帧
+        self._skip_wh = None      # 非 None = 正在等新清晰度首帧, 丢弃此尺寸旧帧
 
     def _base(self):
         return [self.bin] + (["-t", self.connect_key] if self.connect_key else [])
@@ -468,10 +473,14 @@ class HarmonyVideoStream:
                         raise ConnectionError("agent 关闭连接 (未就绪或版本不符)")
                     ack += chunk
                 if b'"result":true' not in ack:
-                    raise ConnectionError(f"ack 异常: {ack[:120]!r}")
+                    # 重试竞态下第二次发起会撞 "Capture already running" — 捕获
+                    # 已在跑正是目标状态, 视为成功
+                    if b'already running' not in ack:
+                        raise ConnectionError(f"ack 异常: {ack[:120]!r}")
                 self._buf = ack[ack.index(b"\n") + 1:]
                 self.sock.settimeout(10)
                 self._last_md5 = None
+                self._skip_wh = None
                 return
             except (OSError, ConnectionError) as e:
                 last_err = e
@@ -542,6 +551,41 @@ class HarmonyVideoStream:
         except OSError:
             pass
 
+    def set_scale(self, scale):
+        """清晰度切换: 同 socket 先 stop 再按新 scale 重发 (无需动 daemon)。
+        stop 生效有 ~1s 延迟, 间隔不足时新 start 撞 already running 被丢弃;
+        切换瞬间内核缓冲里排队的旧档帧由 grab 按 JPEG 尺寸跳过。"""
+        if not self.sock or scale == self.scale:
+            return
+        try:
+            self._send({"module": self.MODULE, "method": "Captures",
+                        "params": {"api": "stopCaptureScreen", "args": {}}})
+            time.sleep(1.2)
+            self._skip_wh = self._last_wh   # 丢弃这个尺寸的旧档排队帧
+            self.scale = scale
+            self._send({"module": self.MODULE, "method": "Captures",
+                        "params": {"api": "startCaptureScreen",
+                                   "args": {"options": {"scale": scale}}}})
+            self._last_md5 = None
+        except OSError:
+            pass
+
+    @staticmethod
+    def _jpeg_wh(frame):
+        """解析 JPEG SOF 段取 (宽, 高) — 清晰度切换时识别旧档残留帧。"""
+        i = 2
+        while i < len(frame) - 9:
+            if frame[i] != 0xFF:
+                return None
+            m = frame[i + 1]
+            if m in (0xC0, 0xC1, 0xC2, 0xC3, 0xC5, 0xC6, 0xC7,
+                     0xC9, 0xCA, 0xCB, 0xCD, 0xCE, 0xCF):
+                h = int.from_bytes(frame[i + 5:i + 7], "big")
+                w = int.from_bytes(frame[i + 7:i + 9], "big")
+                return w, h
+            i += 2 + int.from_bytes(frame[i + 2:i + 4], "big")
+        return None
+
     def grab(self, out_path=None):
         """收一帧 JPEG (socket 直读, SOI/EOI 切帧)。out_path=JPG 保存路径。
         返回 (new_frame, ms, err)。画面变化才推帧 (状态栏秒级跳变也会推);
@@ -557,6 +601,11 @@ class HarmonyVideoStream:
             if i >= 0 and j >= 0:
                 frame = self._buf[i:j + 2]
                 self._buf = self._buf[j + 2:]
+                wh = self._jpeg_wh(frame)
+                if self._skip_wh and wh and wh == self._skip_wh:
+                    continue          # 切档前排队在内核缓冲里的旧分辨率帧
+                self._skip_wh = None
+                self._last_wh = wh
                 md5 = hashlib.md5(frame).hexdigest()
                 if md5 == self._last_md5:
                     dups += 1

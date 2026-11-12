@@ -124,6 +124,18 @@ jobs:
           chmod +x packaging/sign_notarize.sh
           ./packaging/sign_notarize.sh --identity "$IDENTITY" --profile hap-notary
 
+      - name: Verify dmg (挂载自检)
+        run: |
+          hdiutil attach -nobrowse -quiet "packaging/HAP调试助手.dmg"
+          FW="/Volumes/HAP调试助手/HAP调试助手.app/Contents/Frameworks"
+          echo "--- dmg 内 Frameworks ---"
+          du -sm "$FW" | cut -f1 | xargs echo "大小 MB:"
+          ls "$FW" | grep -E "^av$|^grpc$|^tools$" || echo "!! dmg 缺 av/grpc/tools"
+          ls "$FW/tools/" 2>/dev/null
+          hdiutil detach "/Volumes/HAP调试助手"
+          echo "--- dist vs dmg 对照 ---"
+          du -sm "packaging/dist/HAP调试助手.app/Contents/Frameworks" | cut -f1 | xargs echo "dist MB:"
+
       - name: Rename artifact
         env:
           REF: ${{ github.ref_name }}

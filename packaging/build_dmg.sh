@@ -64,7 +64,7 @@ rm -rf dist "HAP调试助手.spec"
   --collect-all grpc \
   $ICON_ARG \
   --paths "$ROOT" \
-  "$ROOT/hap_gui.py" 2>&1 | tail -5
+  "$ROOT/hap_gui.py" 2>&1 | tail -40
 
 APP="dist/HAP调试助手.app"
 [ -d "$APP" ] || { echo "构建失败"; exit 1; }

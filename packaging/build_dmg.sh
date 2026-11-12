@@ -52,6 +52,7 @@ cd "$HERE"
 ICON_ARG=""
 [ -f "$HERE/build/AppIcon.icns" ] && ICON_ARG="--icon=$HERE/build/AppIcon.icns"
 rm -rf dist "HAP调试助手.spec"
+mkdir -p "$HERE/build"
 "$PY" -m PyInstaller --noconfirm --clean --windowed \
   --name "HAP调试助手" \
   --osx-bundle-identifier com.xiaobai.hapinstaller \
@@ -64,7 +65,16 @@ rm -rf dist "HAP调试助手.spec"
   --collect-all grpc \
   $ICON_ARG \
   --paths "$ROOT" \
-  "$ROOT/hap_gui.py" 2>&1 | tail -40
+  "$ROOT/hap_gui.py" > "$HERE/build/pyinstaller_full.log" 2>&1
+RC=$?
+tail -40 "$HERE/build/pyinstaller_full.log"
+[ "$RC" -eq 0 ] || { echo "!! PyInstaller 失败 (rc=$RC), 见 pyinstaller_full.log"; exit 1; }
+# 产物体检: 关键组件缺一不可 (scrcpy 投屏依赖)
+FW="dist/HAP调试助手.app/Contents/Frameworks"
+for c in av grpc PIL tkinterdnd2 tools/agent tools/scrcpy tools/hdc; do
+  [ -e "$FW/$c" ] || { echo "!! 打包缺组件: $c"; exit 1; }
+done
+echo ">> 产物体检通过 (av/grpc/agent/scrcpy/hdc 齐全)"
 
 APP="dist/HAP调试助手.app"
 [ -d "$APP" ] || { echo "构建失败"; exit 1; }

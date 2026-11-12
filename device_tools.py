@@ -740,7 +740,9 @@ class HarmonyScrcpyStream:
     DEVICE_SO = "libscrcpy_server1.z.so"   # uitest < 6.0.2.1 (server0 实测起不来)
     GRPC_PORT = 5000
     POLL_HINT_MS = 30
-    START_ARGS = "-scale 1 -frameRate 30 -bitRate 10 -iFrameInterval 30"
+    # -bitRate 单位是 bps (DevEco 客户端传 UI 值<<20): 10 被编码器 clamp 到极低码率
+    # 导致画面糊, 30Mbps 对齐 HoKit; -iFrameInterval 单位秒
+    START_ARGS = "-scale 1 -frameRate 60 -bitRate 31457280 -iFrameInterval 2"
 
     def __init__(self, hdc_bin, connect_key=None):
         self.bin = hdc_bin

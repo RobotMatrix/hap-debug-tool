@@ -36,6 +36,16 @@ cp -f "$ROOT/tools/scrcpy/"*.so "$TOOLS/scrcpy/" 2>/dev/null \
 
 echo ">> [2/4] 安装 PyInstaller"
 "$PY" -m pip install -q pyinstaller certifi av grpcio 2>&1 | tail -1
+# 探针: CI 上 collect_all('av') 是否解析到 PyAV (曾出现 CI 产物静默缺 av/grpc)
+"$PY" - <<'EOF' 2>&1 | tail -4
+import av
+from PyInstaller.utils.hooks import collect_all
+d, b, h = collect_all("av")
+print(f"[probe] av {av.__version__} at {av.__file__}")
+print(f"[probe] collect_all('av') -> datas={len(d)} binaries={len(b)} hooks={len(h)}")
+d2, b2, h2 = collect_all("grpc")
+print(f"[probe] collect_all('grpc') -> datas={len(d2)} binaries={len(b2)} hooks={len(h2)}")
+EOF
 
 # 版本号注入: APP_VERSION env (workflow 传 tag) > git describe > 回退
 if [ -z "${APP_VERSION:-}" ]; then

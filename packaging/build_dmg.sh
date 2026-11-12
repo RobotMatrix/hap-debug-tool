@@ -29,8 +29,13 @@ mkdir -p "$TOOLS/agent"
 cp -f "$ROOT/tools/agent/"*.so "$TOOLS/agent/" 2>/dev/null \
   || echo "   (缺视频流 agent .so, 投屏回退 snapshot 轮询)"
 
+# 投屏 scrcpy 引擎 server (原生分辨率 H.264): 仓库 tools/scrcpy/ → 打包
+mkdir -p "$TOOLS/scrcpy"
+cp -f "$ROOT/tools/scrcpy/"*.so "$TOOLS/scrcpy/" 2>/dev/null \
+  || echo "   (缺 scrcpy server .so, 超清档回退 JPEG 引擎)"
+
 echo ">> [2/4] 安装 PyInstaller"
-"$PY" -m pip install -q pyinstaller certifi 2>&1 | tail -1
+"$PY" -m pip install -q pyinstaller certifi av grpcio 2>&1 | tail -1
 
 # 版本号注入: APP_VERSION env (workflow 传 tag) > git describe > 回退
 if [ -z "${APP_VERSION:-}" ]; then
@@ -55,6 +60,8 @@ rm -rf dist "HAP调试助手.spec"
   --add-data "$HERE/version.txt:." \
   --collect-all tkinterdnd2 \
   --collect-all certifi \
+  --collect-all av \
+  --collect-all grpc \
   $ICON_ARG \
   --paths "$ROOT" \
   "$ROOT/hap_gui.py" 2>&1 | tail -5

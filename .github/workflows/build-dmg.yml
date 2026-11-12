@@ -27,7 +27,7 @@ jobs:
       - name: Install dependencies
         run: |
           python3 -m pip install --upgrade pip
-          python3 -m pip install pyinstaller pillow tkinterdnd2
+          python3 -m pip install pyinstaller pillow tkinterdnd2 av grpcio
           brew install create-dmg || true
 
       - name: Inject tools (optional)

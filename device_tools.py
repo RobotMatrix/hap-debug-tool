@@ -16,6 +16,7 @@ device_tools.py -- 设备投屏/日志抓取 (鸿蒙 hdc + iOS devicectl/idevice
 import hashlib
 import json
 import os
+import queue
 import re
 import shutil
 import signal
@@ -205,6 +206,67 @@ def _ver_cmp(a, b):
         if x != y:
             return -1 if x < y else 1
     return 0
+
+
+def _kill_uitest_daemons(hdc_bin, connect_key=None):
+    """杀掉设备上全部 uitest daemon。注意: 设备上 pgrep 匹配不到 uitest 进程、
+    killall 报 Permission denied、无 awk — 必须解析 ps 输出按 PID 逐个 kill。"""
+    base = [hdc_bin] + (["-t", connect_key] if connect_key else [])
+    rc, out, _ = _run_capture(base + ["shell", "ps -ef | grep uitest | grep -v grep"],
+                              timeout=15)
+    for line in (out or "").strip().splitlines():
+        parts = line.split()
+        if len(parts) > 1 and parts[1].isdigit():
+            _run(base + ["shell", f"kill -9 {parts[1]}"], timeout=8)
+
+
+def _pb_rd_varint(b, i):
+    v, s = 0, 0
+    while True:
+        x = b[i]; i += 1
+        v |= (x & 0x7F) << s
+        if not x & 0x80:
+            return v, i
+        s += 7
+
+
+def _pb_parse_stream_msg(b):
+    """解析 Scrcpy$ReplyMessage {data=1 bytes, reply_type=2 int,
+    payload=3 map<string,ParamValue>}; 只取 payload 里的 data/flags/len/pts。"""
+    i, out = 0, {}
+    while i < len(b):
+        tag, i = _pb_rd_varint(b, i)
+        fn, wt = tag >> 3, tag & 7
+        if wt == 2:
+            ln, i = _pb_rd_varint(b, i)
+            chunk = b[i:i + ln]; i += ln
+            if fn == 3:                      # map entry {key=1 string, value=2}
+                j, k, v = 0, None, None
+                while j < len(chunk):
+                    t2, j = _pb_rd_varint(chunk, j)
+                    f2, w2 = t2 >> 3, t2 & 7
+                    if w2 == 2:
+                        l2, j = _pb_rd_varint(chunk, j)
+                        c2 = chunk[j:j + l2]; j += l2
+                        if f2 == 1:
+                            k = c2.decode(errors="replace")
+                        elif f2 == 2 and k:   # ParamValue oneof
+                            t3, j3 = _pb_rd_varint(c2, 0)
+                            f3, w3 = t3 >> 3, t3 & 7
+                            if w3 == 2:
+                                l3, j3 = _pb_rd_varint(c2, j3)
+                                if f3 == 5:               # val_bytes
+                                    v = c2[j3:j3 + l3]
+                            elif w3 == 0:
+                                v3, j3 = _pb_rd_varint(c2, j3)
+                                if f3 == 1:               # val_int
+                                    v = v3
+                            out[k] = v
+                    elif w2 == 0:
+                        _, j = _pb_rd_varint(chunk, j)
+        elif wt == 0:
+            _, i = _pb_rd_varint(b, i)
+    return out
 
 
 class HarmonyScreenStream:
@@ -430,9 +492,7 @@ class HarmonyVideoStream:
                                                   self.DEVICE_AGENT], timeout=60)
         if rc != 0:
             raise RuntimeError(f"推送 agent 失败: {(err or '').strip()}")
-        _run(self._base() + ["shell",
-                             "for p in $(pgrep uitest); do kill -9 $p; done"],
-             timeout=10)
+        _kill_uitest_daemons(self.bin, self.connect_key)
         time.sleep(1)
         log_path = self._tmp / "daemon.log"
         self._proc_log = open(log_path, "wb")
@@ -501,55 +561,8 @@ class HarmonyVideoStream:
                               + body + self.TAIL)
             self._session += 1
 
-    # ---- 输入注入 (同 socket RPC, 不挤占录屏会话; uitest CLI 会话会顶掉录屏) ----
-    def _rpc_gesture(self, api, x, y):
-        if not self.sock:
-            return
-        try:
-            self._send({"module": self.MODULE, "method": "Gestures",
-                        "params": {"api": api, "args": {"x": int(x), "y": int(y)}}})
-        except OSError:
-            pass
-
-    def click(self, x_ratio, y_ratio):
-        x, y = x_ratio * self.w, y_ratio * self.h
-        self._rpc_gesture("touchDown", x, y)
-        time.sleep(0.06)
-        self._rpc_gesture("touchUp", x, y)
-
-    def double_click(self, x_ratio, y_ratio):
-        self.click(x_ratio, y_ratio)
-        time.sleep(0.08)
-        self.click(x_ratio, y_ratio)
-
-    def swipe(self, x0r, y0r, x1r, y1r):
-        """8 步插值滑动 (touchDown → touchMove* → touchUp), 模拟真实轨迹。"""
-        x0, y0 = x0r * self.w, y0r * self.h
-        x1, y1 = x1r * self.w, y1r * self.h
-        self._rpc_gesture("touchDown", x0, y0)
-        for i in range(1, 9):
-            t = i / 8
-            self._rpc_gesture("touchMove", x0 + (x1 - x0) * t, y0 + (y1 - y0) * t)
-            time.sleep(0.016)
-        self._rpc_gesture("touchUp", x1, y1)
-
-    def key(self, name):
-        """按键无 Gestures 通道, 走 uitest CLI — 其会话会顶掉录屏, 完成后同
-        socket 重发 startCaptureScreen 自愈 (socket 不断, 只需重新拉起推流)。"""
-        mapping = {"back": "Back", "home": "Home", "power": "Power"}
-        _run(self._base() + ["shell", "uitest", "uiInput", "keyEvent",
-                             mapping.get(name, name)], timeout=10)
-        self._kick_capture()
-
-    def _kick_capture(self):
-        if not self.sock:
-            return
-        try:
-            self._send({"module": self.MODULE, "method": "Captures",
-                        "params": {"api": "startCaptureScreen",
-                                   "args": {"options": {"scale": self.scale}}}})
-        except OSError:
-            pass
+    # 输入注入已统一切 uinput (HarmonyInput, 内核级), 不再用 Gestures RPC —
+    # uitest CLI/Gestures 与录屏会话互相挤占, uinput 完全独立无此问题。
 
     def set_scale(self, scale):
         """清晰度切换: 同 socket 先 stop 再按新 scale 重发 (无需动 daemon)。
@@ -715,8 +728,260 @@ class HarmonyVideoStream:
         shutil.rmtree(self._tmp, ignore_errors=True)
 
 
+class HarmonyScrcpyStream:
+    """鸿蒙投屏 scrcpy 引擎 (DevEco screen-mirroring 同款): uitest daemon 加载
+    libscrcpy server 扩展 (硬编 H.264) → fport → gRPC ScrcpyService/onStart
+    server-streaming 拉流 → PyAV 解码 → 按画布缩放 → PPM (Tk 直读, 不经 sips)。
+    实测 (uitest 5.0.1): 原生 1216×2688 (JPEG 通道上限 1120); 动画 ~2.4fps —
+    老世代 server 逐帧截图+编码的硬上限 (6.x 设备的 unix server 才有真虚拟
+    显示器 30fps); 单帧端到端延迟 ~100ms, 远低于 JPEG 通道的 300ms+。
+    输入走 uinput (HarmonyInput), 与本通道无会话冲突。"""
+
+    DEVICE_SO = "libscrcpy_server1.z.so"   # uitest < 6.0.2.1 (server0 实测起不来)
+    GRPC_PORT = 5000
+    POLL_HINT_MS = 30
+    START_ARGS = "-scale 1 -frameRate 30 -bitRate 10 -iFrameInterval 30"
+
+    def __init__(self, hdc_bin, connect_key=None):
+        self.bin = hdc_bin
+        self.connect_key = connect_key
+        self.fport_port = None
+        self.fit_wh = None            # (w, h) 画布适配目标, 渲染线程每帧读取
+        self._q = queue.Queue()       # 解码出的 PPM 帧 (只保留最新)
+        self._proc = None
+        self._ch = None
+        self._call = None
+        self._thread = None
+        self._dec = None
+        self._err = None
+        self._last_ok = 0.0
+        self._restart_at = 0.0
+        self._restart_lock = threading.Lock()
+        self._running = False
+
+    def _base(self):
+        return [self.bin] + (["-t", self.connect_key] if self.connect_key else [])
+
+    # ---- server 定位 ----
+    @staticmethod
+    def _find_server_so():
+        import zipfile
+        jars = []
+        for pat in ("DevEco-Studio*/Contents/plugins/*/lib/hosScrcpy-*.jar",
+                    "DevEco Studio*/Contents/plugins/*/lib/hosScrcpy-*.jar"):
+            jars += list(Path("/Applications").glob(pat))
+        cache = Path.home() / "Library/Caches/hap_installer/scrcpy"
+        for jar in sorted(set(jars), reverse=True):
+            try:
+                with zipfile.ZipFile(jar) as z:
+                    name = f"libscrcpy/{HarmonyScrcpyStream.DEVICE_SO}"
+                    if name in z.namelist():
+                        cache.mkdir(parents=True, exist_ok=True)
+                        z.extract(name, cache)
+                        return cache / name
+            except Exception:
+                continue
+        for base in (Path(getattr(sys, "_MEIPASS", "") or ".") / "tools" / "scrcpy",
+                     Path(__file__).resolve().parent / "tools" / "scrcpy"):
+            p = base / HarmonyScrcpyStream.DEVICE_SO
+            if p.exists():
+                return p
+        return None
+
+    def _alive(self):
+        rc, out, _ = _run_capture(self._base() +
+                                  ["shell", "ps -ef | grep uitest | grep -v grep"],
+                                  timeout=15)
+        return bool((out or "").strip())
+
+    def start(self):
+        try:
+            import av      # noqa: F401  (解码)
+            import grpc    # noqa: F401  (拉流)
+        except ImportError as e:
+            raise RuntimeError(f"scrcpy 引擎缺依赖 ({e}; pip install av grpcio)")
+        so = self._find_server_so()
+        if not so:
+            raise RuntimeError("找不到 libscrcpy server (需装 DevEco Studio, "
+                               f"或把 {self.DEVICE_SO} 放入 tools/scrcpy/)")
+        _kill_uitest_daemons(self.bin, self.connect_key)
+        time.sleep(1)
+        rc, _, err = _run_capture(self._base() + ["file", "send", str(so),
+                                                  f"/data/local/tmp/{self.DEVICE_SO}"],
+                                  timeout=120)
+        if rc != 0:
+            raise RuntimeError(f"推送 server 失败: {(err or '').strip()}")
+        _run(self._base() + ["shell", f"chmod +x /data/local/tmp/{self.DEVICE_SO}"],
+             timeout=8)
+        self._proc = subprocess.Popen(
+            self._base() + ["shell",
+                            f"/system/bin/uitest start-daemon singleness "
+                            f"--extension-name {self.DEVICE_SO} "
+                            f"-p {self.GRPC_PORT} {self.START_ARGS}"],
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+            start_new_session=True)
+        # 等 daemon bind 5000 (垂死实例占 socket 时秒级释放)
+        for _ in range(16):
+            if self._alive():
+                break
+            time.sleep(0.5)
+        else:
+            raise RuntimeError("scrcpy server daemon 未起来")
+        self.fport_port = self._alloc_fport()
+        self._connect_stream()
+
+    def _alloc_fport(self):
+        lo = 18300
+        for _ in range(4):
+            for port in range(lo, lo + 20):
+                rc, out, _e = _run_capture(
+                    self._base() + ["fport", f"tcp:{port}", f"tcp:{self.GRPC_PORT}"],
+                    timeout=15)
+                if rc == 0 and "OK" in (out or ""):
+                    return port
+            for port in range(lo, lo + 20):   # 清残留规则重试
+                _run(self._base() + ["fport", "rm", f"tcp:{port}",
+                                     f"tcp:{self.GRPC_PORT}"], timeout=8)
+            time.sleep(1)
+        raise RuntimeError("fport 建立失败 (scrcpy 5000 转发不可用)")
+
+    def _connect_stream(self):
+        """建 gRPC 通道并启动拉流/解码线程。"""
+        import grpc
+        self._ch = grpc.insecure_channel(f"127.0.0.1:{self.fport_port}")
+        grpc.channel_ready_future(self._ch).result(timeout=6)
+        self._err = None
+        self._running = True
+        self._thread = threading.Thread(target=self._reader, daemon=True)
+        self._thread.start()
+        self._request_idr()   # 立刻要关键帧: 有 IDR 基准才能解后续 P 帧
+
+    def _request_idr(self):
+        try:
+            self._ch.unary_unary("/ScrcpyService/onRequestIDRFrame",
+                                 request_serializer=lambda m: b"",
+                                 response_deserializer=lambda b: b"")(b"")
+        except Exception:
+            pass
+
+    def _reader(self):
+        """拉流线程: gRPC 消息 (payload.data = Annex-B H.264) → PyAV 解码 →
+        按画布缩放 → PPM 入队 (只保留最新, 渲染永远拿最新帧, 旧帧即延迟)。"""
+        import av
+        try:
+            self._dec = av.CodecContext.create("h264", "r")
+            self._call = self._ch.stream_stream(
+                "/ScrcpyService/onStart",
+                request_serializer=lambda m: b"",
+                response_deserializer=_pb_parse_stream_msg)(iter([b""]))
+            for msg in self._call:
+                if not self._running:
+                    break
+                data = msg.get("data")
+                if not isinstance(data, (bytes, bytearray)):
+                    continue
+                try:
+                    packet = av.Packet(bytes(data))
+                    for frame in self._dec.decode(packet):
+                        self._emit(frame)
+                    self._last_ok = time.time()
+                except Exception as de:
+                    if "Invalid data" in str(de):
+                        # SPS/PPS 单独成包会抛此错但解码器已正常吸收参数集;
+                        # 无 IDR 基准的 P 帧也走这 — 忽略, 等 IDR 到来即恢复。
+                        # 切勿重建解码器 (会丢参数集, 之后全崩)。
+                        continue
+                    raise
+        except Exception as e:
+            if self._running:
+                self._err = str(e)[:120]
+
+    def _emit(self, frame):
+        """解码帧 → 画布适配缩放 → PPM, 丢弃积压只留最新。"""
+        import av
+        w, h = self.fit_wh or (frame.width, frame.height)
+        scale = min(w / frame.width, h / frame.height, 1.0)
+        tw = max(int(frame.width * scale) & ~1, 2)
+        th = max(int(frame.height * scale) & ~1, 2)
+        if (tw, th) != (frame.width, frame.height):
+            frame = frame.reformat(width=tw, height=th, format="rgb24")
+        else:
+            frame = frame.reformat(format="rgb24")
+        p = frame.planes[0]
+        raw = bytes(p)
+        stride, row = p.line_size, frame.width * 3
+        body = raw if stride == row else \
+            b"".join(raw[y * stride:y * stride + row] for y in range(frame.height))
+        ppm = f"P6\n{frame.width} {frame.height}\n255\n".encode() + body
+        with self._q.mutex:
+            self._q.queue.clear()
+        self._q.put(ppm)
+
+    def grab(self, out_path=None, timeout_s=0.25):
+        """取最新解码帧 (PPM)。返回 (new_frame, ms, err); 无新帧且 daemon
+        存活 = 画面静止, 不算错误。"""
+        t0 = time.time()
+        try:
+            ppm = self._q.get(timeout=timeout_s)
+        except queue.Empty:
+            if self._err:
+                return False, 0, f"scrcpy 流断开: {self._err}"
+            if self._alive():
+                return False, int((time.time() - t0) * 1000), ""
+            return False, 0, "scrcpy daemon 已退出"
+        if out_path:
+            Path(out_path).write_bytes(ppm)
+        return True, int((time.time() - t0) * 1000), ""
+
+    def restart_session(self):
+        """断线重连: daemon 杀掉整链重启 (带冷却, 防连环轰炸)。"""
+        with self._restart_lock:
+            wait = self._restart_at - time.time()
+            if wait > 0:
+                time.sleep(wait)
+            if self._last_ok and time.time() - self._last_ok < 15:
+                return  # 流其实是好的
+            self._restart_at = time.time() + 5
+            self.stop_stream()
+            self.start()
+
+    def stop_stream(self):
+        self._running = False
+        for closer in (lambda: self._call.cancel(), lambda: self._ch.close()):
+            try:
+                closer()
+            except Exception:
+                pass
+        self._call = self._ch = None
+        with self._q.mutex:
+            self._q.queue.clear()
+        self._err = None
+
+    def stop(self):
+        self.stop_stream()
+        if self._proc and self._proc.poll() is None:
+            try:
+                os.killpg(self._proc.pid, signal.SIGKILL)
+            except Exception:
+                self._proc.kill()
+        self._proc = None
+
+    def cleanup(self):
+        self.stop()
+        if getattr(self, "fport_port", None):
+            _run(self._base() + ["fport", "rm", f"tcp:{self.fport_port}",
+                                 f"tcp:{self.GRPC_PORT}"], timeout=8)
+            self.fport_port = None
+        _kill_uitest_daemons(self.bin, self.connect_key)
+        _run(self._base() + ["shell", f"rm -f /data/local/tmp/{self.DEVICE_SO}"],
+             timeout=8)
+
+
 class HarmonyInput:
-    """鸿蒙输入回传: uitest uiInput (click/swipe/keyEvent/inputText)。"""
+    """鸿蒙输入回传: 触摸走 uinput -T (内核级注入, 与任何投屏会话无冲突);
+    按键走 uitest uiInput keyEvent (uinput -K 键码在该设备不触发系统键;
+    uitest 短会话实测不挤 scrcpy 扩展流; JPEG agent 流会被顶掉, GUI 端
+    触发 restart_session 自愈)。"""
 
     def __init__(self, hdc_bin, connect_key=None, screen_wh=(1216, 2688)):
         self.bin = hdc_bin
@@ -724,24 +989,29 @@ class HarmonyInput:
         self.w, self.h = screen_wh
 
     def _base(self):
-        return [self.bin] + (["-t", self.connect_key] if self.connect_key else [])
+        return [self.bin] + (["-t", self.connect_key] if self.connect_key else []) \
+            + ["shell"]
 
     def click(self, x_ratio, y_ratio):
         x, y = int(x_ratio * self.w), int(y_ratio * self.h)
-        _run(self._base() + ["shell", "uitest", "uiInput", "click", str(x), str(y)], timeout=10)
+        _run(self._base() + [f"uinput -T -c {x} {y}"], timeout=8)
 
     def double_click(self, x_ratio, y_ratio):
         x, y = int(x_ratio * self.w), int(y_ratio * self.h)
-        _run(self._base() + ["shell", "uitest", "uiInput", "doubleClick", str(x), str(y)], timeout=10)
+        _run(self._base() + [f"uinput -T -c {x} {y}"], timeout=8)
+        time.sleep(0.12)
+        _run(self._base() + [f"uinput -T -c {x} {y}"], timeout=8)
 
     def swipe(self, x0r, y0r, x1r, y1r):
-        a = [int(x0r * self.w), int(y0r * self.h), int(x1r * self.w), int(y1r * self.h)]
-        _run(self._base() + ["shell", "uitest", "uiInput", "swipe", *map(str, a)], timeout=10)
+        """uinput -T -m 平滑拖拽 (内核侧插值, 单命令完成)。"""
+        x0, y0 = int(x0r * self.w), int(y0r * self.h)
+        x1, y1 = int(x1r * self.w), int(y1r * self.h)
+        _run(self._base() + [f"uinput -T -m {x0} {y0} {x1} {y1}"], timeout=8)
 
     def key(self, name):
         mapping = {"back": "Back", "home": "Home", "power": "Power"}
-        k = mapping.get(name, name)
-        _run(self._base() + ["shell", "uitest", "uiInput", "keyEvent", k], timeout=10)
+        _run(self._base() + [f"uitest uiInput keyEvent {mapping.get(name, name)}"],
+             timeout=10)
 
 
 class HarmonyLogs:

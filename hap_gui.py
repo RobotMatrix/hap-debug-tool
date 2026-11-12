@@ -1576,12 +1576,12 @@ class MirrorWindow:
         self.lbl_fps = ttk.Label(bar, text="—", style="Sub.TLabel")
         self.lbl_fps.pack(side="left", padx=(10, 0))
         if platform == "harmony":
-            # 清晰度 (仅视频流模式可见; 档位定义在 DT.HarmonyVideoStream)
-            self._quality_var = tk.StringVar(value=DT.HarmonyVideoStream.SCALE_OPTIONS[0][0])
+            # 画质/引擎: 超清 = scrcpy 引擎原生分辨率 (回退 JPEG 0.9);
+            # 高清/流畅 = JPEG 引擎缩放档
+            self._quality_var = tk.StringVar(value="超清")
             self._quality_cb = ttk.Combobox(bar, textvariable=self._quality_var,
                                             width=4, state="readonly",
-                                            values=[n for n, _ in
-                                                    DT.HarmonyVideoStream.SCALE_OPTIONS])
+                                            values=["超清", "高清", "流畅"])
             self._quality_cb.pack(side="left", padx=(10, 0))
             self._quality_cb.bind("<<ComboboxSelected>>",
                                   lambda e: self._on_quality_change())
@@ -1594,6 +1594,7 @@ class MirrorWindow:
         self.canvas.bind("<Double-Button-1>", self._on_double)
         self.canvas.bind("<ButtonPress-1>", self._on_press_xy)
         self.canvas.bind("<ButtonRelease-1>", self._on_release_swipe)
+        self.canvas.bind("<Configure>", self._on_canvas_resize)
         self.bind_scroll()
 
         foot = ttk.Frame(w)
@@ -1609,32 +1610,29 @@ class MirrorWindow:
     def bind_scroll(self):
         pass
 
+    # 画质档 → JPEG 引擎 scale (超清档由 scrcpy 引擎承接, JPEG 回退用 0.9)
+    JPEG_SCALES = {"高清": 0.75, "流畅": 0.5}
+
     def start_capture(self):
         try:
             if self.platform == "harmony":
                 hdc_bin = H.Tools().tool("hdc")
                 wh = self._probe_harmony_wh()
-                try:
-                    # 视频流 (Hypium agent, DevEco 同款): 帧率远超 snapshot 轮询;
-                    # 输入走同 socket RPC (uitest CLI 会话会顶掉录屏流)
-                    self.capture = DT.HarmonyVideoStream(hdc_bin, self.device_key,
-                                                         screen_wh=wh)
-                    self.capture.start()
-                    self.input = self.capture
-                    self.app.log("[+] 投屏: Hypium agent 视频流")
-                except Exception as e:
-                    # 无 DevEco/agent 推送失败等 → 回退 snapshot 双循环轮询
-                    self.app.log(f"[-] 视频流不可用: {e}")
-                    self.app.log("[-] 回退 snapshot 轮询模式")
+                tier = self._quality_var.get() if hasattr(self, "_quality_var") else "超清"
+                if tier == "超清":
+                    # scrcpy 引擎: 原生分辨率硬编 H.264, 单帧低延迟
                     try:
-                        self.capture.cleanup()  # 清掉可能已推送的 agent/fport
-                    except Exception:
-                        pass
-                    self.capture = DT.HarmonyScreenStream(hdc_bin, self.device_key)
-                    self.capture.start()
-                    self.input = DT.HarmonyInput(hdc_bin, self.device_key, screen_wh=wh)
-                    if hasattr(self, "_quality_cb"):   # 轮询模式无档位可切
-                        self._quality_cb.pack_forget()
+                        self.capture = DT.HarmonyScrcpyStream(hdc_bin, self.device_key)
+                        self._update_fit_wh()
+                        self.capture.start()
+                        self.app.log("[+] 投屏: scrcpy 引擎 (原生分辨率·低延迟)")
+                    except Exception as e:
+                        self.app.log(f"[-] scrcpy 引擎不可用: {e}")
+                        self._start_jpeg(hdc_bin, wh, 0.9)
+                else:
+                    self._start_jpeg(hdc_bin, wh, self.JPEG_SCALES[tier])
+                # 输入统一切 uinput (内核级, 不会挤掉任何投屏会话)
+                self.input = DT.HarmonyInput(hdc_bin, self.device_key, screen_wh=wh)
             else:
                 self.capture = DT.IOSScreen(self.device_key)
         except Exception as e:
@@ -1643,6 +1641,38 @@ class MirrorWindow:
             return
         self._running = True
         self.lbl_status.config(text="● 投屏中", foreground=self.app.C["success"])
+
+    def _start_jpeg(self, hdc_bin, wh, scale):
+        """JPEG 引擎 (Hypium agent), 失败回退 snapshot 双循环轮询。"""
+        try:
+            self.capture = DT.HarmonyVideoStream(hdc_bin, self.device_key,
+                                                 scale=scale, screen_wh=wh)
+            self.capture.start()
+            self.app.log(f"[+] 投屏: Hypium agent 视频流 (scale={scale})")
+        except Exception as e:
+            self.app.log(f"[-] 视频流不可用: {e}")
+            self.app.log("[-] 回退 snapshot 轮询模式")
+            try:
+                self.capture.cleanup()  # 清掉可能已推送的 agent/fport
+            except Exception:
+                pass
+            self.capture = DT.HarmonyScreenStream(hdc_bin, self.device_key)
+            self.capture.start()
+            if hasattr(self, "_quality_cb"):   # 轮询模式无档位可切
+                self._quality_cb.pack_forget()
+
+    def _update_fit_wh(self, *_):
+        """画布尺寸 → scrcpy 引擎渲染线程 (帧按此缩放, Tk 不再二次采样)。"""
+        c = getattr(self, "capture", None)
+        if c is not None and hasattr(c, "fit_wh"):
+            c.fit_wh = (max(self.canvas.winfo_width(), 100),
+                        max(self.canvas.winfo_height(), 100))
+
+    def _on_canvas_resize(self, _e):
+        now = time.time()
+        if now - getattr(self, "_last_resize", 0) > 0.3:
+            self._last_resize = now
+            self._update_fit_wh()
 
     def _probe_harmony_wh(self):
         rc, out, _ = DT._run([H.Tools().tool("hdc")] + (["-t", self.device_key] if self.device_key else [])
@@ -1654,7 +1684,9 @@ class MirrorWindow:
 
     def _poll(self):
         if not self._running:
+            self._polling = False
             return
+        self._polling = True
         def work():
             ok, ms, err = self.capture.grab(self._shot_png)
             self._frame_q.put((ok, ms, err))
@@ -1666,16 +1698,18 @@ class MirrorWindow:
 
     def _drain_frame(self):
         if not self._running:
+            self._polling = False
             return
         try:
             ok, ms, err = self._frame_q.get_nowait()
         except queue.Empty:
-            self.win.after(60, self._drain_frame)
+            self.win.after(20, self._drain_frame)
             return
         self._frame_done(ok, ms, err)
 
     def _frame_done(self, ok, ms, err):
         if not self._running:
+            self._polling = False
             return
         if ok:
             try:
@@ -1707,11 +1741,21 @@ class MirrorWindow:
             self.win.after(30, self._poll)
 
     def _make_display_frame(self):
-        """显示帧: sips 按画布重采样。Tk>=8.6 用 PNG (24bit 真彩, 清晰);
-        Tk 8.5 (PNG 不支持) 回退 GIF (256 色量化, 较模糊)。"""
+        """显示帧: PPM (scrcpy 引擎, 已按画布缩放) Tk 直读零转换;
+        JPEG (agent 通道) 走 sips 重采样 (Tk>=8.6 PNG, 8.5 回退 GIF)。"""
         cw = max(self.canvas.winfo_width(), 200)
         ch = max(self.canvas.winfo_height(), 300)
-        src = str(self._shot_png)
+        src = self._shot_png
+        try:
+            head = src.read_bytes()[:64]
+            if head.startswith(b"P6"):
+                toks = head.split(b"\n", 2)
+                w, h = (int(x) for x in toks[1].split())
+                self._src_wh = (w, h)
+                return str(src)      # Tk 原生支持 PPM, 内容嗅探不看扩展名
+        except Exception:
+            pass
+        src = str(src)
         try:
             out = subprocess.run(["sips", "-g", "pixelWidth", "-g", "pixelHeight", src],
                                  capture_output=True, text=True, timeout=10).stdout
@@ -1792,13 +1836,26 @@ class MirrorWindow:
         threading.Thread(target=lambda: self.input.key(name), daemon=True).start()
 
     def _on_quality_change(self):
-        """清晰度切换: 同 socket 重发捕获 (不动 daemon, 不断流)。"""
+        """画质切换: JPEG 引擎内档位切换走同 socket 重发; 涉及 scrcpy↔JPEG
+        引擎切换则整链重启 (两者 daemon 互斥)。"""
+        tier = self._quality_var.get()
         c = getattr(self, "capture", None)
-        if not c or not hasattr(c, "set_scale"):
+        if not c:
             return
-        scale = dict(DT.HarmonyVideoStream.SCALE_OPTIONS).get(self._quality_var.get())
-        if scale:
-            threading.Thread(target=c.set_scale, args=(scale,), daemon=True).start()
+        if isinstance(c, DT.HarmonyVideoStream) and tier in self.JPEG_SCALES:
+            threading.Thread(target=c.set_scale,
+                             args=(self.JPEG_SCALES[tier],), daemon=True).start()
+            return
+        # 引擎切换: 清旧链 (线程) → 主线程重建 (start_capture 含 Tk 更新)
+        def rebuild():
+            try:
+                c.cleanup()
+            except Exception:
+                pass
+            self.win.after(0, self.start_capture)
+        self._running = False
+        self.lbl_status.config(text="● 切换中", foreground=self.app.C["accent"])
+        threading.Thread(target=rebuild, daemon=True).start()
 
     def save_screenshot(self):
         src = self._shot_png
@@ -1808,10 +1865,24 @@ class MirrorWindow:
         dest = filedialog.asksaveasfilename(
             defaultextension=".png", initialfile=f"screen-{time.strftime('%Y%m%d-%H%M%S')}.png",
             filetypes=[("PNG", "*.png")])
-        if dest:
+        if not dest:
+            return
+        if src.read_bytes()[:2] == b"P6":
+            # PPM 帧 (scrcpy 引擎) → av 编码 PNG; 失败回退文件名直存
+            try:
+                from PIL import Image
+                data = src.read_bytes()
+                lines = data.split(b"\n", 3)      # P6 / "w h" / 255 / body
+                w, h = (int(x) for x in lines[1].split())
+                body = data.index(b"255\n", 4) + 4
+                Image.frombytes("RGB", (w, h), data[body:]).save(dest, "PNG")
+            except Exception as e:
+                Path(dest).write_bytes(src.read_bytes())
+                self.app.log(f"[!] PNG 转码失败 ({e}), 已存原始 PPM")
+        else:
             import shutil as _sh
             _sh.copy2(src, dest)
-            self.app.log(f"[+] 截图已保存: {dest}")
+        self.app.log(f"[+] 截图已保存: {dest}")
 
     def close(self):
         self._running = False

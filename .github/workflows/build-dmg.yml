@@ -67,6 +67,17 @@ jobs:
           test -f packaging/tools/signer && test -f packaging/tools/store/key.pem \
             || { echo "::error title=工具不完整::packaging/tools 缺 signer 或 store/key.pem"; exit 1; }
 
+      - name: Debug checkout (诊断)
+        run: |
+          echo "--- build_dmg.sh md5 ---"
+          md5 -q packaging/build_dmg.sh
+          echo "--- collect-all 行 ---"
+          grep -n "collect-all" packaging/build_dmg.sh || echo "!! 无 collect-all"
+          echo "--- packaging/tools/ ---"
+          ls packaging/tools/
+          echo "--- 仓库 tools/ ---"
+          ls tools/agent tools/scrcpy 2>&1 || echo "!! 仓库 tools 缺失"
+
       - name: Build dmg (未签名)
         env:
           APP_VERSION: ${{ github.ref_name }}
